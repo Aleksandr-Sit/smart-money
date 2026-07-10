@@ -1,0 +1,14 @@
+# секреты — НИКОГДА в git
+.env
+*.key
+
+# окружение
+.venv/
+__pycache__/
+*.pyc
+
+# данные и вывод
+output/
+*.duckdb
+*.duckdb.wal
+data/

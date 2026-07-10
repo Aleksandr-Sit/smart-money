@@ -1,0 +1,47 @@
+# Параметры Контура 1 (discovery). Всё настраиваемое — здесь, не в коде.
+# Значения — стартовые (MVP), калибруются на train-выборке, НЕ подкручиваются под красивый список.
+
+universe:
+  PEAK_MC_MIN_USD: 5_000_000    # токен попадает в universe, если пиковая капа ≥ этого
+  LOOKBACK_DAYS: 90             # окно набора токенов
+  MATURITY_DAYS: 14             # токен запущен ≥ N дней назад (виден полный round-trip)
+  # анти-survivorship: добавляем выборку НЕ запампивших токенов
+  INCLUDE_DEAD_SAMPLE: true
+  DEAD_SAMPLE_RATIO: 1.0        # сколько мёртвых на 1 памповый (1.0 = поровну)
+  DEAD_PEAK_MC_MAX_USD: 300_000 # «мёртвый» = пик не превысил этого
+
+early_entry:                    # вход считается «ранним», если ЛЮБОЕ из условий:
+  EARLY_FRAC: 0.05              #   капа на входе ≤ 5% от пиковой
+  EARLY_MINUTES: 60            #   ИЛИ первые 60 минут жизни токена
+  # (bonding-curve progress добавим, когда сверим доступность поля в Dune)
+
+success:                        # ранний вход считается «выигрышным», если ЛЮБОЕ:
+  WIN_MULT: 5.0                 #   реализованный мультипликатор ≥ 5x
+  EXIT_FRAC: 0.5               #   ИЛИ продажа при ≥ 50% от пиковой капы
+
+scoring:
+  MIN_EARLY_TOKENS: 5          # минимум ранних входов, чтобы кошелёк вообще считался
+  MIN_WINS: 3                  # отсев one-hit-wonders: ≥3 НЕЗАВИСИМЫХ выигрышных токена
+  RECENCY_DAYS: 30             # активен ли в последние N дней
+  weights:                     # score = сумма взвешенных компонент − штрафы
+    hit_rate: 1.0
+    log_n_wins: 1.0
+    recency: 0.5
+    agg_profit: 0.5
+
+copyability:                    # Модуль D — отсечь то, что нельзя повторить
+  EXCLUDE_DEPLOY_BLOCK: true    # покупка в genesis/деплой-блоке = insider, не копируется
+  EXCLUDE_SAME_BLOCK_SNIPER: true  # вход в блок 0 через бота — не успеть
+  MIN_HOLD_SECONDS: 300        # слишком быстрый round-trip → низкая копируемость/бот
+
+bot_flags:                      # эвристики вошинга/ботов
+  MAX_ROUNDTRIPS_PER_HOUR: 20
+  FLAG_ADJACENT_SLOT_INOUT: true
+
+validation:
+  SPLIT_DATE: null             # дата T (YYYY-MM-DD). null = авто: середина LOOKBACK.
+                               # train = до T, validation = T..now
+
+output:
+  TOP_N: 200                   # размер watchlist
+  dir: "./output"

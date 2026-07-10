@@ -1,0 +1,9 @@
+services:
+  monitor:
+    build: .
+    container_name: smart-money-monitor
+    restart: unless-stopped
+    volumes:
+      - ./.env:/app/.env:ro          # секреты (HELIUS_API_KEY, опц. TELEGRAM_*)
+      - ./output:/app/output          # флоу-watchlist (вход) + signals.log/paper (выход)
+    # логи процесса — через docker logs

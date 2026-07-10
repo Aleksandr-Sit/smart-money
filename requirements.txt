@@ -1,0 +1,9 @@
+dune-client>=1.7      # официальный клиент Dune API (from dune_client.client import DuneClient)
+duckdb>=1.1           # локальная агрегация кросс-токенных метрик
+pandas>=2.2
+pyyaml>=6.0           # чтение config/params.yaml
+python-dotenv>=1.0
+tenacity>=8.2         # ретраи запросов к Dune
+tqdm>=4.66            # прогресс по батчам токенов
+requests>=2.31        # RugCheck / Helius RPC / Telegram
+websockets>=12.0      # Контур 2: Helius WS-стрим

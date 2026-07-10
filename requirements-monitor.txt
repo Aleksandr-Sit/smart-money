@@ -1,0 +1,6 @@
+# Лёгкие зависимости ТОЛЬКО для Контура 2 (монитор). Без duckdb/pandas/dune — они нужны
+# лишь офлайн-discovery. Образ для 24/7 на VPS держим минимальным.
+requests>=2.31
+websockets>=12.0
+python-dotenv>=1.0
+pyyaml>=6.0
