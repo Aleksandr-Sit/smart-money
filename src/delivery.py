@@ -18,10 +18,8 @@ from .signal_engine import Signal
 
 def _links(mint: str) -> dict[str, str]:
     return {
-        "dexscreener": f"https://dexscreener.com/solana/{mint}",
-        "solscan": f"https://solscan.io/token/{mint}",
-        "gmgn": f"https://gmgn.ai/sol/token/{mint}",
-        "jupiter": f"https://jup.ag/swap/SOL-{mint}",
+        "dexscreener": f"https://dexscreener.com/solana/{mint}",  # график (смотреть)
+        "gmgn": f"https://gmgn.ai/sol/token/{mint}",              # покупка (в т.ч. bonding-curve pump.fun)
     }
 
 
@@ -47,7 +45,7 @@ def format_message(sig: Signal, safety: dict, info: dict | None = None) -> str:
         f"объём в окне: ${sig.window_usd:,} · сила: {sig.strength}\n"
         f"{market_line}"
         f"safety: {sv_emoji} {sv} ({risks})\n"
-        f"📈 {lk['dexscreener']}\n🔎 {lk['solscan']}"
+        f"📈 график: {lk['dexscreener']}\n⚡ купить (GMGN): {lk['gmgn']}"
     )
 
 
@@ -101,7 +99,7 @@ def format_exit(pos, exit_price: float, reason: str, realized_pnl: float) -> str
         f"token: {pos.token_mint}\n"
         f"вышло акторов: {len(pos.exited_actors)}/{len(pos.entry_actors)}\n"
         f"вход MC {_fmt_usd(pos.entry_mc)} → выход ~{_fmt_usd((exit_price or 0) * 1_000_000_000)}\n"
-        f"📈 {lk['dexscreener']}\n🔎 {lk['solscan']}"
+        f"📈 {lk['dexscreener']}"
     )
 
 
