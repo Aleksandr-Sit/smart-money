@@ -18,8 +18,9 @@ from .signal_engine import Signal
 
 def _links(mint: str) -> dict[str, str]:
     return {
-        "dexscreener": f"https://dexscreener.com/solana/{mint}",  # график (смотреть)
-        "gmgn": f"https://gmgn.ai/sol/token/{mint}",              # покупка (в т.ч. bonding-curve pump.fun)
+        "dexscreener": f"https://dexscreener.com/solana/{mint}",   # график (смотреть)
+        "gmgn": f"https://gmgn.ai/sol/token/{mint}",               # покупка (pump.fun вкл. кривую)
+        "bullx": f"https://neo.bullx.io/terminal?address={mint}&chainId=1399811149",  # token deep-link
     }
 
 
@@ -45,7 +46,9 @@ def format_message(sig: Signal, safety: dict, info: dict | None = None) -> str:
         f"объём в окне: ${sig.window_usd:,} · сила: {sig.strength}\n"
         f"{market_line}"
         f"safety: {sv_emoji} {sv} ({risks})\n"
-        f"📈 график: {lk['dexscreener']}\n⚡ купить (GMGN): {lk['gmgn']}"
+        f"📈 график: {lk['dexscreener']}\n"
+        f"⚡ GMGN: {lk['gmgn']}\n"
+        f"⚡ BullX: {lk['bullx']}"
     )
 
 
