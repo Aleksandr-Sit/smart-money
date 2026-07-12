@@ -72,19 +72,21 @@ def send_telegram(text: str) -> bool:
         return False
 
 
-def deliver(sig: Signal, safety: dict, info: dict | None = None, paper: bool = True) -> None:
+def deliver(sig: Signal, safety: dict, info: dict | None = None,
+            paper: bool = True, telegram: bool = True) -> None:
     now = datetime.now(timezone.utc).isoformat()
     info = info or {}
     rec = {"ts": now, "signal": asdict(sig), "safety_verdict": safety.get("verdict"),
            "risks": safety.get("risks"), "market": info}
-    _append(config.OUTPUT_DIR / "signals.log", rec)
-    if paper and safety.get("verdict") != "danger":   # PAPER не входим в danger
+    _append(config.OUTPUT_DIR / "signals.log", rec)          # лог ВСЕГДА (для анализа)
+    if paper and safety.get("verdict") != "danger":          # PAPER не входим в danger
         _append(config.OUTPUT_DIR / "paper_positions.jsonl",
                 {"ts": now, "token_mint": sig.token_mint, "level": sig.level,
                  "n_actors": sig.n_actors, "strength": sig.strength,
                  "entry_mc": info.get("mc"), "entry_price_usd": info.get("price_usd"),
                  "velocity_buys_h1": info.get("buys_h1"), "status": "open"})
-    send_telegram(format_message(sig, safety, info))
+    if telegram:                                             # алерт только по решению вызывающего
+        send_telegram(format_message(sig, safety, info))
 
 
 def _demo() -> None:

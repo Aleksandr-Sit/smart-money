@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import statistics
+from datetime import datetime, timezone
 
 from . import config, market
 
@@ -27,12 +28,18 @@ def main() -> None:
         info = market.token_info(p["token_mint"])
         cur_mc, cur_price = info.get("mc"), info.get("price_usd")
         e_price, e_mc = p.get("entry_price_usd"), p.get("entry_mc")
+        try:
+            age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(p["ts"])).total_seconds() / 3600
+        except Exception:  # noqa: BLE001
+            age_h = None
         if e_price and cur_price:
             ret = cur_price / e_price - 1
         elif e_mc and cur_mc:
             ret = cur_mc / e_mc - 1
+        elif (e_price or e_mc) and not (cur_price or cur_mc) and age_h is not None and age_h > 1:
+            ret = -1.0    # нет на DexScreener спустя >1ч → мёртвый токен (тотал-лосс)
         else:
-            ret = None
+            ret = None    # ещё рано судить (нет entry ИЛИ токен молодой без данных)
         rows.append({**p, "cur_mc": cur_mc, "ret": ret})
 
     scored = [r for r in rows if r["ret"] is not None]

@@ -42,14 +42,22 @@ async def run(max_mc: float, seconds: int | None) -> None:
         if not signal:
             return
         info = await loop.run_in_executor(None, market.token_info, signal.token_mint)
+        # entry price/MC из ОН-ЧЕЙН покупки (DexScreener не знает совсем свежие токены)
+        oc_price = (buy["sol_spent"] / buy["base_amount"] * sol) if buy.get("base_amount") else None
+        if not info.get("price_usd") and oc_price:
+            info["price_usd"] = oc_price
+        if not info.get("mc") and oc_price:
+            info["mc"] = oc_price * 1_000_000_000        # pump.fun supply 1e9
         mc = info.get("mc")
-        if mc and mc > max_mc:                       # строгий early-MC чек: уже не ранний
+        if mc and mc > max_mc:                            # early-MC чек: уже не ранний
             print(f"[skip late] {signal.token_mint} MC ${mc:,.0f} > {max_mc:,.0f}")
             return
         saf = await loop.run_in_executor(None, safety.screen, signal.token_mint)
-        await loop.run_in_executor(None, delivery.deliver, signal, saf, info, True)
+        # Telegram только для сильных и не-danger; всё пишем в signals.log в любом случае
+        alert = signal.level == "strong" and saf.get("verdict") in ("ok", "warn")
+        await loop.run_in_executor(None, delivery.deliver, signal, saf, info, True, alert)
         print(f"[SIGNAL {signal.level}] {signal.token_mint} n_actors={signal.n_actors} "
-              f"MC=${(mc or 0):,.0f} velocity={info.get('buys_h1')} safety={saf.get('verdict')}")
+              f"MC=${(mc or 0):,.0f} velocity={info.get('buys_h1')} safety={saf.get('verdict')} tg={alert}")
 
     batches = _split(wallets, 5)
     print(f"[monitor] {len(wallets)} кошельков / {len(amap)} актор-весов, "
