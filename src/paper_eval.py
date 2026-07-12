@@ -1,8 +1,7 @@
-"""Оценка PAPER-PnL — форвард-валидация флоу-сигнала.
+"""Оценка PAPER — форвард-валидация флоу-сигнала по РЕАЛИЗОВАННЫМ round-trip (вход→выход).
 
-Читает output/paper_positions.jsonl, по каждой позиции тянет текущую цену/MC (DexScreener),
-считает доходность (по цене, иначе по MC), выдаёт win-rate и медиану. Запускать периодически
-после накопления сигналов.
+Главное: paper_closed.jsonl (закрытые позиции с realized_pnl + причина выхода) → win-rate,
+медиана/среднее доходности, разбивка по причинам. Плюс открытые позиции (нереализованные).
 
 Run:  .venv\\Scripts\\python.exe -m src.paper_eval
 """
@@ -10,55 +9,53 @@ from __future__ import annotations
 
 import json
 import statistics
-from datetime import datetime, timezone
+from collections import defaultdict
 
 from . import config, market
 
 
+def _load(name: str) -> list[dict]:
+    p = config.OUTPUT_DIR / name
+    if not p.exists():
+        return []
+    return [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
 def main() -> None:
-    path = config.OUTPUT_DIR / "paper_positions.jsonl"
-    if not path.exists():
-        print("нет paper_positions.jsonl")
-        return
-    positions = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    print(f"PAPER-позиций: {len(positions)}")
-
-    rows = []
-    for p in positions:
-        info = market.token_info(p["token_mint"])
-        cur_mc, cur_price = info.get("mc"), info.get("price_usd")
-        e_price, e_mc = p.get("entry_price_usd"), p.get("entry_mc")
-        try:
-            age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(p["ts"])).total_seconds() / 3600
-        except Exception:  # noqa: BLE001
-            age_h = None
-        if e_price and cur_price:
-            ret = cur_price / e_price - 1
-        elif e_mc and cur_mc:
-            ret = cur_mc / e_mc - 1
-        elif (e_price or e_mc) and not (cur_price or cur_mc) and age_h is not None and age_h > 1:
-            ret = -1.0    # нет на DexScreener спустя >1ч → мёртвый токен (тотал-лосс)
-        else:
-            ret = None    # ещё рано судить (нет entry ИЛИ токен молодой без данных)
-        rows.append({**p, "cur_mc": cur_mc, "ret": ret})
-
-    scored = [r for r in rows if r["ret"] is not None]
-    if scored:
-        rets = [r["ret"] for r in scored]
+    closed = [c for c in _load("paper_closed.jsonl") if c.get("realized_pnl") is not None]
+    print(f"=== ЗАКРЫТЫЕ round-trip (реализованные): {len(closed)} ===")
+    if closed:
+        rets = [c["realized_pnl"] for c in closed]
         wins = sum(1 for x in rets if x > 0)
-        print(f"\nОценено: {len(scored)} | win-rate: {wins/len(scored):.2f} | "
-              f"median ret: {statistics.median(rets):+.2%} | mean: {statistics.mean(rets):+.2%}")
-        for lvl in ("strong", "weak"):
-            sub = [r["ret"] for r in scored if r.get("level") == lvl]
-            if sub:
-                w = sum(1 for x in sub if x > 0)
-                print(f"  {lvl:<6}: n={len(sub)} win-rate {w/len(sub):.2f} median {statistics.median(sub):+.2%}")
+        print(f"win-rate: {wins/len(closed):.2f} | median: {statistics.median(rets):+.1%} | "
+              f"mean: {statistics.mean(rets):+.1%} | сумма: {sum(rets):+.1%}")
+        by = defaultdict(list)
+        for c in closed:
+            by[c.get("reason", "?")].append(c["realized_pnl"])
+        print("по причине выхода:")
+        for reason, rr in sorted(by.items(), key=lambda kv: -len(kv[1])):
+            w = sum(1 for x in rr if x > 0)
+            print(f"  {reason:<12} n={len(rr):<3} win {w/len(rr):.2f} median {statistics.median(rr):+.1%}")
 
-    print(f"\n{'token':<14} {'lvl':<6} {'entry_mc':>10} {'cur_mc':>10} {'ret':>8}")
-    for r in sorted(rows, key=lambda x: (x["ret"] is None, -(x["ret"] or 0))):
-        ret = f"{r['ret']:+.1%}" if r["ret"] is not None else "n/a"
-        print(f"{r['token_mint'][:12]:<14} {str(r.get('level')):<6} "
-              f"{str(r.get('entry_mc')):>10} {str(r.get('cur_mc')):>10} {ret:>8}")
+    # открытые позиции (нереализованные, по текущей цене)
+    try:
+        openp = json.loads((config.OUTPUT_DIR / "open_positions.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        openp = {}
+    print(f"\n=== ОТКРЫТЫЕ позиции: {len(openp)} ===")
+    unreal = []
+    for token, p in list(openp.items())[:40]:
+        info = market.token_info(token)
+        cur = info.get("price_usd")
+        ep = p.get("entry_price")
+        ur = (cur / ep - 1) if (cur and ep) else None
+        if ur is not None:
+            unreal.append(ur)
+        print(f"  {token[:14]:<14} entry_mc={p.get('entry_mc')} "
+              f"актор_вышло={len(p.get('exited_actors', []))}/{len(p.get('entry_actors', []))} "
+              f"unreal={f'{ur:+.0%}' if ur is not None else 'n/a'}")
+    if unreal:
+        print(f"нереализованная медиана: {statistics.median(unreal):+.1%}")
 
 
 if __name__ == "__main__":
