@@ -5,15 +5,28 @@
 """
 from __future__ import annotations
 
+import json
 import time
 
 import requests
 
+from . import config
+
 WSOL = "So11111111111111111111111111111111111111112"
 FALLBACK_SOL = 170.0
 DS = "https://api.dexscreener.com/latest/dex/tokens"
+_SOL_STATE = config.OUTPUT_DIR / "sol_price.json"
 
-_sol_cache = {"price": FALLBACK_SOL, "ts": 0.0}
+
+def _load_last_sol() -> float:
+    """Последний ЖИВОЙ курс с диска (переживает рестарт) — лучше статичного FALLBACK."""
+    try:
+        return float(json.loads(_SOL_STATE.read_text(encoding="utf-8"))["price"])
+    except Exception:  # noqa: BLE001
+        return FALLBACK_SOL
+
+
+_sol_cache = {"price": _load_last_sol(), "ts": 0.0}
 
 
 def _best_pair(pairs: list[dict]) -> dict | None:
@@ -35,6 +48,11 @@ def sol_price(max_age_s: int = 300) -> float:
                     best, best_liq = float(p["priceUsd"]), liq
         if best:
             _sol_cache.update(price=best, ts=time.time())
+            try:                              # персист живого курса (fallback после рестарта)
+                _SOL_STATE.write_text(json.dumps({"price": best, "ts": _sol_cache["ts"]}),
+                                      encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                pass
     except Exception:  # noqa: BLE001
         pass
     return _sol_cache["price"]

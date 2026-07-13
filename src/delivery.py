@@ -119,6 +119,11 @@ def deliver_exit(pos, exit_price: float, reason: str, telegram: bool = True) -> 
         send_telegram(format_exit(pos, exit_price, reason, realized if realized is not None else 0.0))
 
 
+def send_heartbeat(text: str) -> bool:
+    """Пульс: подтверждает, что монитор жив. Тишина в Telegram ≠ 'нет сигналов'."""
+    return send_telegram("💓 " + text)
+
+
 def _demo() -> None:
     from .signal_engine import Signal as S
     sig = S(token_mint="FMqh9mqR6drPZqqW6wPqLHxX4rqNDWGhYLaMfoaJpump", ts=1000.0,

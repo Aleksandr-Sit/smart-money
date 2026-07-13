@@ -12,10 +12,11 @@ import argparse
 import asyncio
 import time
 
-from . import delivery, helius_ws, market, positions, safety, tx_parse
+from . import delivery, helius, helius_ws, market, positions, price_track, safety, tx_parse
 from .signal_engine import BuyEvent, SignalEngine, load_actor_map
 
 PRICE_POLL_S = 90
+HEARTBEAT_S = 6 * 3600
 
 
 def _split(items: list, n: int) -> list[list]:
@@ -27,7 +28,9 @@ async def run(max_mc: float, seconds: int | None) -> None:
     wallets = list(amap.keys())
     engine = SignalEngine(amap)
     pm = positions.PositionManager()
+    tracker = price_track.PriceTracker()
     seen_sigs: set[str] = set()
+    stats = {"signals": 0, "strong": 0, "opens": 0, "exits": 0, "started": time.time()}
     loop = asyncio.get_event_loop()
 
     async def emit_exit(token: str, exit_price: float, reason: str) -> None:
@@ -37,6 +40,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
         await loop.run_in_executor(None, delivery.deliver_exit, p, exit_price, reason, True)
         r = (exit_price / p.entry_price - 1) if (p.entry_price and exit_price) else None
         print(f"[EXIT {reason}] {token} realized={r:+.0%}" if r is not None else f"[EXIT {reason}] {token}")
+        stats["exits"] += 1
         pm.close(token)
 
     async def on_event(wallet: str, sig: str) -> None:
@@ -76,13 +80,41 @@ async def run(max_mc: float, seconds: int | None) -> None:
         if mc and mc > max_mc:
             print(f"[skip late] {token} MC ${mc:,.0f} > {max_mc:,.0f}")
             return
+        # трекинг траектории для consumer-mode оценки (не зависит от жизни paper-позиции)
+        try:
+            tracker.register(token, info.get("price_usd"), ev.ts)
+        except Exception as e:  # noqa: BLE001
+            print(f"[track] register fail {token[:8]}: {type(e).__name__}")
         saf = await loop.run_in_executor(None, safety.screen, token)
         alert = signal.level == "strong" and saf.get("verdict") in ("ok", "warn")
         await loop.run_in_executor(None, delivery.deliver, signal, saf, info, True, alert)
+        stats["signals"] += 1
+        if signal.level == "strong":
+            stats["strong"] += 1
         if saf.get("verdict") != "danger":
-            pm.open(token, info.get("price_usd"), info.get("mc"), signal.actors, ev.ts)
+            if pm.open(token, info.get("price_usd"), info.get("mc"), signal.actors, ev.ts):
+                stats["opens"] += 1
         print(f"[SIGNAL {signal.level}] {token} n_actors={signal.n_actors} "
               f"MC=${(mc or 0):,.0f} safety={saf.get('verdict')} tg={alert} open={len(pm.open_tokens())}")
+
+    async def heartbeat() -> None:
+        def _rpc_alive() -> str:
+            try:                              # живость Helius RPC (баланс кредитов через RPC недоступен)
+                r = helius.rpc("getHealth", [])
+                return "ok" if r.get("result") == "ok" else "?"
+            except Exception:  # noqa: BLE001
+                return "нет связи"
+        # пульс при старте — подтверждает, что новый деплой поднялся
+        await loop.run_in_executor(None, delivery.send_heartbeat,
+                                   f"монитор запущен · {len(wallets)} кош./{len(batches)} WS · "
+                                   f"SOL=${market.sol_price():.2f} · открытых={len(pm.open_tokens())}")
+        while True:
+            await asyncio.sleep(HEARTBEAT_S)
+            up_h = (time.time() - stats["started"]) / 3600
+            msg = (f"жив {up_h:.0f}ч · сигналов={stats['signals']} (strong={stats['strong']}) · "
+                   f"входов={stats['opens']} выходов={stats['exits']} · открытых={len(pm.open_tokens())} · "
+                   f"трек={len(tracker.active)} · SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}")
+            await loop.run_in_executor(None, delivery.send_heartbeat, msg)
 
     async def price_watch() -> None:
         while True:
@@ -105,6 +137,8 @@ async def run(max_mc: float, seconds: int | None) -> None:
     tasks = [asyncio.create_task(helius_ws.subscribe_wallets(b, on_event, label=str(i)))
              for i, b in enumerate(batches)]
     tasks.append(asyncio.create_task(price_watch()))
+    tasks.append(asyncio.create_task(tracker.run()))
+    tasks.append(asyncio.create_task(heartbeat()))
     if seconds:
         await asyncio.sleep(seconds)
         for t in tasks:
