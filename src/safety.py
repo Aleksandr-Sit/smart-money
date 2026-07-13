@@ -10,14 +10,14 @@ Run (тест на реальном mint):
 from __future__ import annotations
 
 import sys
+import time
 
 import requests
 
 BASE = "https://api.rugcheck.xyz/v1"
 
 
-def screen(mint: str, timeout: int = 20) -> dict:
-    """Вернуть {verdict, score, risks, raw}. verdict: 'ok'|'warn'|'danger'|'unknown'."""
+def _fetch(mint: str, timeout: int) -> dict:
     url = f"{BASE}/tokens/{mint}/report/summary"
     try:
         r = requests.get(url, timeout=timeout, headers={"Accept": "application/json"})
@@ -25,8 +25,25 @@ def screen(mint: str, timeout: int = 20) -> dict:
         return {"verdict": "unknown", "error": f"{type(e).__name__}: {e}"}
     if r.status_code != 200:
         return {"verdict": "unknown", "http": r.status_code, "body": r.text[:200]}
+    return {"data": r.json()}
 
-    data = r.json()
+
+def screen(mint: str, timeout: int = 20, retries: int = 1) -> dict:
+    """Вернуть {verdict, score, risks, raw}. verdict: 'ok'|'warn'|'danger'|'unknown'.
+
+    unknown = сеть/HTTP-сбой → один ретрай перед fail-open (не пускать позицию вслепую из-за
+    случайного таймаута). Настоящий 'danger' от RugCheck ретраем НЕ трогаем.
+    """
+    res = _fetch(mint, timeout)
+    for _ in range(retries):
+        if "data" in res:
+            break
+        time.sleep(1)
+        res = _fetch(mint, timeout)
+    if "data" not in res:
+        return {"verdict": "unknown", **{k: v for k, v in res.items() if k != "data"}}
+
+    data = res["data"]
     risks = data.get("risks", []) or []
     levels = {str(x.get("level", "")).lower() for x in risks}
     if "danger" in levels:

@@ -11,12 +11,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import time
+from collections import deque
 
 from . import delivery, helius, helius_ws, market, positions, price_track, safety, tx_parse
 from .signal_engine import BuyEvent, SignalEngine, load_actor_map
 
 PRICE_POLL_S = 90
 HEARTBEAT_S = 6 * 3600
+SEEN_MAX = 100_000
 
 
 def _split(items: list, n: int) -> list[list]:
@@ -30,6 +32,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
     pm = positions.PositionManager()
     tracker = price_track.PriceTracker()
     seen_sigs: set[str] = set()
+    seen_order: deque[str] = deque()      # FIFO-эвикция: не сбрасываем дедуп разом
     stats = {"signals": 0, "strong": 0, "opens": 0, "exits": 0, "started": time.time()}
     loop = asyncio.get_event_loop()
 
@@ -47,8 +50,9 @@ async def run(max_mc: float, seconds: int | None) -> None:
         if sig in seen_sigs:
             return
         seen_sigs.add(sig)
-        if len(seen_sigs) > 100_000:
-            seen_sigs.clear()
+        seen_order.append(sig)
+        if len(seen_order) > SEEN_MAX:        # выкидываем только самую старую
+            seen_sigs.discard(seen_order.popleft())
         trade = await loop.run_in_executor(None, tx_parse.parse_trade, sig, wallet)
         if not trade:
             return
