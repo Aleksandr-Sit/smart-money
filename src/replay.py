@@ -40,8 +40,13 @@ def load_trajectories(rows: list[dict] | None = None) -> dict[str, list[tuple[fl
     return traj
 
 
-def load_signal_meta(rows: list[dict] | None = None) -> dict[str, dict]:
-    """mint -> {ts, level, n_actors} по ПЕРВОМУ сигналу входа (не exit)."""
+def load_signal_meta(rows: list[dict] | None = None, entry: str = "first") -> dict[str, dict]:
+    """mint -> {ts, level, n_actors} по моменту входа.
+
+    entry='first'  — первый сигнал по токену (всегда weak при CONFLUENCE_N=2).
+    entry='strong' — момент ПЕРВОГО strong-сигнала (честное торгуемое правило: входим,
+                     когда пришёл 3-й актор; без look-ahead 'ever_strong').
+    """
     if rows is None:
         p = config.OUTPUT_DIR / "signals.log"
         rows = [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines()
@@ -51,8 +56,10 @@ def load_signal_meta(rows: list[dict] | None = None) -> dict[str, dict]:
         sig = r.get("signal")
         if not sig:                     # exit-записи пропускаем
             continue
+        if entry == "strong" and sig["level"] != "strong":
+            continue
         mint = sig["token_mint"]
-        if mint not in meta:            # первый сигнал = момент входа
+        if mint not in meta:            # первый подходящий сигнал = момент входа
             meta[mint] = {"ts": sig["ts"], "level": sig["level"], "n_actors": sig["n_actors"]}
     return meta
 
@@ -143,6 +150,8 @@ def main() -> None:
     ap.add_argument("--fee", type=float, default=0.06, help="round-trip издержки (доля)")
     ap.add_argument("--grid", action="store_true", help="перебор EXIT_CFG")
     ap.add_argument("--compare", action="store_true", help="сравнить вход +5с vs +60с (дефолт)")
+    ap.add_argument("--entry", choices=("first", "strong"), default="first",
+                    help="момент входа: первый сигнал | первый strong (3-й актор)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -150,7 +159,8 @@ def main() -> None:
         _selftest()
         return
 
-    traj, meta = load_trajectories(), load_signal_meta()
+    traj, meta = load_trajectories(), load_signal_meta(entry=args.entry)
+    print(f"режим входа: {args.entry}")
     tracked = sum(1 for m in meta if m in traj and len(traj[m]) >= 2)
     print(f"сигналов: {len(meta)} · с траекторией (≥2 точек): {tracked} · "
           f"всего токенов в истории: {len(traj)}")
@@ -162,23 +172,27 @@ def main() -> None:
     if args.grid:
         delay = args.delay if args.delay is not None else 5.0
         print(f"\n--- GRID калибровка выхода · вход +{delay:.0f}с · fee {args.fee:.0%} ---")
-        best = None
-        for tp in (1.5, 2.0, 2.5, 3.0, 4.0):
-            for sl in (0.4, 0.5, 0.6):
+        rows = []
+        for tp in (2.0, 2.5, 3.0, 4.0, 6.0, 8.0):
+            for sl in (0.4, 0.5, 0.6, 0.7):
                 for hold in (600, 1200, 1800, 3600):
                     cfg = {**DEFAULT_EXIT, "TP": tp, "SL": sl, "MAX_HOLD_S": hold}
                     rr = evaluate(delay, cfg, args.fee, traj, meta).get("all", [])
                     if len(rr) < 20:
                         continue
-                    med = statistics.median(rr)
-                    row = (med, sum(rr) / len(rr), tp, sl, hold, len(rr))
-                    if best is None or med > best[0]:
-                        best = row
-        if best:
-            print(f"лучший по медиане: TP={best[2]} SL={best[3]} hold={best[4]}с → "
-                  f"median={best[0]:+.1%} mean={best[1]:+.1%} n={best[5]}")
-        else:
+                    srt = sorted(rr, reverse=True)
+                    rows.append((statistics.mean(rr), statistics.median(rr),
+                                 sum(rr) - sum(srt[:3]),   # устойчивость: без топ-3 сделок
+                                 tp, sl, hold, len(rr),
+                                 sum(1 for x in rr if x > 0) / len(rr)))
+        if not rows:
             print("недостаточно данных для сетки (нужно ≥20 сделок на конфиг).")
+            return
+        rows.sort(reverse=True)          # по mean; sum-top3 показывает, не хвост ли это
+        print("  mean    | med     | sum-top3 | TP  SL  hold | n · win")
+        for mn, md, st3, tp, sl, hold, n, w in rows[:10]:
+            print(f"  {mn:+7.1%} | {md:+6.1%} | {st3:+8.0%} | {tp:<3} {sl:<3} {hold:<4} | n={n} win={w:.2f}")
+        print("[!] sum-top3 < 0 ⇒ весь плюс в 3 сделках-хвостах — конфиг НЕ устойчив.")
         return
 
     # дефолт: сравнение режимов потребителя на дефолтном выходе
