@@ -22,6 +22,10 @@ DEFAULTS = {
     "SIGNAL_MAX_MC_USD": 100_000,   # токен ещё ранний
     "SIGNAL_MAX_AGE_S": 3600,       # возраст токена <= 1ч
     "SIGNAL_MIN_USD": 20,           # не пыль
+    # «тихий конфлюенс»: малый суммарный объём в окне = ранняя органическая фаза (не FOMO-пик).
+    # Порог $250 из train-only разреза (5-дневный ресерч): quiet-сигналы на OOS дали mean +38.7%,
+    # sum-top3 +110%, «громкие» −23.6%. ПРОВИЗОРНЫЙ — калибровать вторым OOS-периодом.
+    "QUIET_MAX_USD": 250,
 }
 
 
@@ -45,6 +49,10 @@ class Signal:
     strength: float
     level: str                   # 'weak' | 'strong'
     first_buy_ts: float
+    quiet: bool = False          # window_usd < QUIET_MAX_USD — «тихий» = лучший класс (см. ресерч)
+    first_gap_s: float = 0.0     # сек от первой покупки в окне до схождения (формирование конфлюенса)
+    n_buys: int = 0              # всего покупок в окне (для будущих OOS: DCA vs уник)
+    actor_first_usd: float = 0.0  # сумма ПЕРВЫХ покупок по актору (без DCA) — для будущей замены метрики
 
 
 def load_actor_map(path: Path | None = None) -> dict[str, tuple[str, float]]:
@@ -83,9 +91,12 @@ class SignalEngine:
 
         # разные акторы в окне
         actors: dict[str, float] = {}
+        actor_first: dict[str, float] = {}   # первая покупка по актору (без DCA-дублей)
         total_usd = 0.0
         for _ts, aid, wt, usd in st["buys"]:
             actors[aid] = max(actors.get(aid, 0.0), wt)
+            if aid not in actor_first:
+                actor_first[aid] = usd
             total_usd += usd
         n = len(actors)
         if n < self.cfg["CONFLUENCE_N"] or n <= st["last_n"]:
@@ -94,9 +105,14 @@ class SignalEngine:
 
         strength = round(sum(actors.values()) + total_usd / 1000.0, 2)
         level = "strong" if n >= self.cfg["STRONG_CONFLUENCE_N"] else "weak"
+        total_usd_r = round(total_usd)
         return Signal(token_mint=ev.token_mint, ts=ev.ts, actors=list(actors), n_actors=n,
-                      window_usd=round(total_usd), strength=strength, level=level,
-                      first_buy_ts=st["buys"][0][0])
+                      window_usd=total_usd_r, strength=strength, level=level,
+                      first_buy_ts=st["buys"][0][0],
+                      quiet=total_usd_r < self.cfg["QUIET_MAX_USD"],
+                      first_gap_s=round(ev.ts - st["buys"][0][0], 1),
+                      n_buys=len(st["buys"]),
+                      actor_first_usd=round(sum(actor_first.values())))
 
 
 # ---------- синтетический self-test ----------

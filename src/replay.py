@@ -60,7 +60,9 @@ def load_signal_meta(rows: list[dict] | None = None, entry: str = "first") -> di
             continue
         mint = sig["token_mint"]
         if mint not in meta:            # первый подходящий сигнал = момент входа
-            meta[mint] = {"ts": sig["ts"], "level": sig["level"], "n_actors": sig["n_actors"]}
+            meta[mint] = {"ts": sig["ts"], "level": sig["level"], "n_actors": sig["n_actors"],
+                          "window_usd": sig.get("window_usd", 0),
+                          "quiet": sig.get("quiet", sig.get("window_usd", 1e9) < 250)}
     return meta
 
 
@@ -152,6 +154,8 @@ def main() -> None:
     ap.add_argument("--compare", action="store_true", help="сравнить вход +5с vs +60с (дефолт)")
     ap.add_argument("--entry", choices=("first", "strong"), default="first",
                     help="момент входа: первый сигнал | первый strong (3-й актор)")
+    ap.add_argument("--quiet-max", type=float, default=None,
+                    help="только 'тихие' сигналы: window_usd < этого (напр. 250)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -160,6 +164,10 @@ def main() -> None:
         return
 
     traj, meta = load_trajectories(), load_signal_meta(entry=args.entry)
+    if args.quiet_max is not None:
+        before = len(meta)
+        meta = {m: v for m, v in meta.items() if v.get("window_usd", 0) < args.quiet_max}
+        print(f"quiet-фильтр window_usd < ${args.quiet_max:.0f}: {len(meta)}/{before} сигналов")
     print(f"режим входа: {args.entry}")
     tracked = sum(1 for m in meta if m in traj and len(traj[m]) >= 2)
     print(f"сигналов: {len(meta)} · с траекторией (≥2 точек): {tracked} · "

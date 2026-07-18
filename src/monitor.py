@@ -33,7 +33,8 @@ async def run(max_mc: float, seconds: int | None) -> None:
     tracker = price_track.PriceTracker()
     seen_sigs: set[str] = set()
     seen_order: deque[str] = deque()      # FIFO-эвикция: не сбрасываем дедуп разом
-    stats = {"signals": 0, "strong": 0, "opens": 0, "exits": 0, "started": time.time()}
+    stats = {"signals": 0, "strong": 0, "quiet": 0, "alerts": 0, "opens": 0, "exits": 0,
+             "started": time.time()}
     loop = asyncio.get_event_loop()
 
     async def emit_exit(token: str, exit_price: float, reason: str) -> None:
@@ -58,7 +59,15 @@ async def run(max_mc: float, seconds: int | None) -> None:
             return
         sol = await loop.run_in_executor(None, market.sol_price)
         token = trade["token_mint"]
-        price = (trade["sol"] / trade["base_amount"] * sol) if trade.get("base_amount") else None
+        # цена: продажа за стейбл → из usd_proceeds; иначе SOL-нога за вычетом fee (точность)
+        if trade.get("base_amount"):
+            if trade.get("usd_proceeds"):
+                price = trade["usd_proceeds"] / trade["base_amount"]
+            else:
+                net_sol = max(0.0, trade["sol"] - trade.get("fee", 0.0))
+                price = net_sol / trade["base_amount"] * sol
+        else:
+            price = None
 
         # --- ПРОДАЖА: actor-exit ---
         if trade["side"] == "sell":
@@ -90,16 +99,23 @@ async def run(max_mc: float, seconds: int | None) -> None:
         except Exception as e:  # noqa: BLE001
             print(f"[track] register fail {token[:8]}: {type(e).__name__}")
         saf = await loop.run_in_executor(None, safety.screen, token)
-        alert = signal.level == "strong" and saf.get("verdict") in ("ok", "warn")
+        # Telegram — ТОЛЬКО лучший класс: strong + ТИХИЙ + safety ok/warn (ресерч: quiet +38.7% OOS).
+        # Лог и paper пишут ВСЕ сигналы (нужен знаменатель + продолжение OOS по обеим группам).
+        alert = signal.level == "strong" and signal.quiet and saf.get("verdict") in ("ok", "warn")
         await loop.run_in_executor(None, delivery.deliver, signal, saf, info, True, alert)
         stats["signals"] += 1
         if signal.level == "strong":
             stats["strong"] += 1
+        if signal.quiet:
+            stats["quiet"] += 1
+        if alert:
+            stats["alerts"] += 1
         if saf.get("verdict") != "danger":
             if pm.open(token, info.get("price_usd"), info.get("mc"), signal.actors, ev.ts):
                 stats["opens"] += 1
-        print(f"[SIGNAL {signal.level}] {token} n_actors={signal.n_actors} "
-              f"MC=${(mc or 0):,.0f} safety={saf.get('verdict')} tg={alert} open={len(pm.open_tokens())}")
+        print(f"[SIGNAL {signal.level}{'/quiet' if signal.quiet else ''}] {token} "
+              f"n_actors={signal.n_actors} usd=${signal.window_usd} MC=${(mc or 0):,.0f} "
+              f"safety={saf.get('verdict')} tg={alert} open={len(pm.open_tokens())}")
 
     async def heartbeat() -> None:
         def _rpc_alive() -> str:
@@ -115,7 +131,8 @@ async def run(max_mc: float, seconds: int | None) -> None:
         while True:
             await asyncio.sleep(HEARTBEAT_S)
             up_h = (time.time() - stats["started"]) / 3600
-            msg = (f"жив {up_h:.0f}ч · сигналов={stats['signals']} (strong={stats['strong']}) · "
+            msg = (f"жив {up_h:.0f}ч · сигналов={stats['signals']} "
+                   f"(strong={stats['strong']} тихих={stats['quiet']} алертов={stats['alerts']}) · "
                    f"входов={stats['opens']} выходов={stats['exits']} · открытых={len(pm.open_tokens())} · "
                    f"трек={len(tracker.active)} · SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}")
             await loop.run_in_executor(None, delivery.send_heartbeat, msg)

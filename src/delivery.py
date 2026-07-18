@@ -30,6 +30,8 @@ def _fmt_usd(v) -> str:
 
 def format_message(sig: Signal, safety: dict, info: dict | None = None) -> str:
     emoji = "🟢" if sig.level == "strong" else "🟡"
+    # класс конвикции: 🔇 тихий (лучший по ресерчу) / 📢 громкий (FOMO-пик, исторически хуже)
+    quiet_tag = "🔇 ТИХИЙ" if getattr(sig, "quiet", False) else "📢 громкий"
     sv = safety.get("verdict", "unknown")
     sv_emoji = {"ok": "✅", "warn": "⚠️", "danger": "⛔", "unknown": "❓"}.get(sv, "❓")
     lk = _links(sig.token_mint)
@@ -40,10 +42,10 @@ def format_message(sig: Signal, safety: dict, info: dict | None = None) -> str:
         market_line = (f"MC {_fmt_usd(info.get('mc'))} · liq {_fmt_usd(info.get('liquidity_usd'))} · "
                        f"buys(1h) {info.get('buys_h1', '—')} (velocity)\n")
     return (
-        f"{emoji} CONFLUENCE [{sig.level.upper()}] — {sig.n_actors} акторов\n"
+        f"{emoji} CONFLUENCE [{sig.level.upper()}] {quiet_tag} — {sig.n_actors} акторов\n"
         f"token: {sig.token_mint}\n"
         f"акторы: {', '.join(a[:8] for a in sig.actors)}\n"
-        f"объём в окне: ${sig.window_usd:,} · сила: {sig.strength}\n"
+        f"объём в окне: ${sig.window_usd:,} · сила: {sig.strength} · набор {getattr(sig, 'first_gap_s', 0):.0f}с\n"
         f"{market_line}"
         f"safety: {sv_emoji} {sv} ({risks})\n"
         f"📈 график: {lk['dexscreener']}\n"
