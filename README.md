@@ -1,5 +1,12 @@
 # smart-money — discovery недооткрытых кошельков (Контур 1)
 
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![DuckDB](https://img.shields.io/badge/DuckDB-analytics-FFF000?logo=duckdb&logoColor=black)
+![Solana](https://img.shields.io/badge/Solana-on--chain-9945FF?logo=solana&logoColor=white)
+![Dune](https://img.shields.io/badge/Dune-dex__solana.trades-F4511E)
+![status](https://img.shields.io/badge/status-WIP-yellow)
+![last commit](https://img.shields.io/github/last-commit/Aleksandr-Sit/smart-money)
+
 Поиск кошельков, которые **систематически** заходят рано в мем-токены Solana и выходят
 в прибыль на **многих** токенах, с приоритетом на **недооткрытые** адреса (которых ещё
 нет в публичных лидербордах GMGN/Cielo). Результат Контура 1 — ранжированный `watchlist`.
