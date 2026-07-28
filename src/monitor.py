@@ -16,7 +16,6 @@ from collections import deque
 from . import delivery, helius, helius_ws, market, positions, price_track, safety, tx_parse
 from .signal_engine import BuyEvent, SignalEngine, load_actor_map
 
-PRICE_POLL_S = 90
 HEARTBEAT_S = 6 * 3600
 SEEN_MAX = 100_000
 
@@ -137,19 +136,18 @@ async def run(max_mc: float, seconds: int | None) -> None:
                    f"трек={len(tracker.active)} · SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}")
             await loop.run_in_executor(None, delivery.send_heartbeat, msg)
 
-    async def price_watch() -> None:
-        while True:
-            await asyncio.sleep(PRICE_POLL_S)
-            for token in pm.open_tokens():
-                p = pm.get(token)
-                if not p:
-                    continue
-                info = await loop.run_in_executor(None, market.token_info, token)
-                cur = info.get("price_usd")
-                age_h = (time.time() - p.entry_ts) / 3600
-                reason = pm.check_price(token, cur, age_h)
-                if reason:
-                    await emit_exit(token, cur or 0.0, reason)
+    async def exit_tick(prices: dict) -> None:
+        """Выходы на 15с-цикле трекера (было 90с — на такой гранулярности edge исчезал, см. аудит).
+        prices — свежие цены с бондинг-кривой за этот тик; None = нет данных → dead по возрасту."""
+        for token in pm.open_tokens():
+            p = pm.get(token)
+            if not p:
+                continue
+            cur = prices.get(token)
+            age_h = (time.time() - p.entry_ts) / 3600
+            reason = pm.check_price(token, cur, age_h)
+            if reason:
+                await emit_exit(token, cur or 0.0, reason)
 
     batches = _split(wallets, 5)
     print(f"[monitor] {len(wallets)} кошельков, {len(batches)} WS-соединений, "
@@ -157,8 +155,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
           f"открытых позиций={len(pm.open_tokens())}. Слушаю (вход+выход)...")
     tasks = [asyncio.create_task(helius_ws.subscribe_wallets(b, on_event, label=str(i)))
              for i, b in enumerate(batches)]
-    tasks.append(asyncio.create_task(price_watch()))
-    tasks.append(asyncio.create_task(tracker.run()))
+    tasks.append(asyncio.create_task(tracker.run(on_tick=exit_tick)))   # выходы на 15с-цикле трекера
     tasks.append(asyncio.create_task(heartbeat()))
     if seconds:
         await asyncio.sleep(seconds)

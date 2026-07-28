@@ -149,12 +149,16 @@ class PriceTracker:
             self._append(r)
         return rows
 
-    async def run(self) -> None:
+    async def run(self, on_tick=None) -> None:
+        """Каждые TICK_S поллит цены. on_tick(prices: dict[mint,price]) — драйвер выходов на 15с
+        (вместо отдельной медленной петли): даёт exit-гранулярность == валидированной."""
         loop = asyncio.get_event_loop()
         while True:
             await asyncio.sleep(TICK_S)
             try:
-                await loop.run_in_executor(None, self._poll_once)
+                rows = await loop.run_in_executor(None, self._poll_once)
+                if on_tick and rows is not None:
+                    await on_tick({r["mint"]: r["price_usd"] for r in rows})
             except Exception as e:  # noqa: BLE001
                 print(f"[track] loop error: {type(e).__name__}: {e}")
 

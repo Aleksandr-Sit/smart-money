@@ -19,6 +19,7 @@ EXIT_CFG = {
     "TRAIL": 0.35,            # трейлинг: падение от пика на эту долю
     "TRAIL_ARM": 1.5,         # трейлинг включается после роста >= этого × entry
     "DEAD_AGE_H": 1.0,        # нет данных дольше → мёртвый (-100%)
+    "MAX_HOLD_S": 1800,       # max-hold таймаут (== replay); дольше не держим (иначе рассинхрон с валидацией)
 }
 
 
@@ -76,19 +77,23 @@ class PositionManager:
         p = self.pos.get(token)
         if not p:
             return None
+        # порядок правил == replay: сначала ценовые (TP/SL/trail), потом таймаут, потом dead
+        if cur_price is not None:
+            if cur_price > p.peak_price:
+                p.peak_price = cur_price
+                self._save()
+            mult = cur_price / p.entry_price if p.entry_price else 0
+            if mult >= self.cfg["TP_MULT"]:
+                return "take_profit"
+            if mult <= self.cfg["SL_MULT"]:
+                return "stop_loss"
+            peak_mult = p.peak_price / p.entry_price if p.entry_price else 0
+            if peak_mult >= self.cfg["TRAIL_ARM"] and cur_price <= p.peak_price * (1 - self.cfg["TRAIL"]):
+                return "trailing"
+        if age_h * 3600 >= self.cfg["MAX_HOLD_S"]:   # таймаут == replay (не держим дольше валидации)
+            return "timeout"
         if cur_price is None:
             return "dead" if age_h > self.cfg["DEAD_AGE_H"] else None
-        if cur_price > p.peak_price:
-            p.peak_price = cur_price
-            self._save()
-        mult = cur_price / p.entry_price if p.entry_price else 0
-        if mult >= self.cfg["TP_MULT"]:
-            return "take_profit"
-        if mult <= self.cfg["SL_MULT"]:
-            return "stop_loss"
-        peak_mult = p.peak_price / p.entry_price if p.entry_price else 0
-        if peak_mult >= self.cfg["TRAIL_ARM"] and cur_price <= p.peak_price * (1 - self.cfg["TRAIL"]):
-            return "trailing"
         return None
 
     def close(self, token: str) -> Position | None:
@@ -118,6 +123,6 @@ if __name__ == "__main__":   # самотест логики выходов
     print("SL (0.4x):", pm.check_price("TOK", 0.0004, 0.1))
     pm.check_price("TOK", 0.002, 0.1)                      # взводим peak на 2x
     print("trailing (0.0012 vs peak 0.002):", pm.check_price("TOK", 0.0012, 0.1))
-    print("dead (нет цены, age 2ч):", pm.check_price("TOK", None, 2.0))
+    print("timeout (age 2ч > max-hold 0.5ч):", pm.check_price("TOK", None, 2.0))
     if f.exists():
         os.remove(f)
