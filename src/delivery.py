@@ -34,6 +34,7 @@ def format_message(sig: Signal, safety: dict, info: dict | None = None) -> str:
     quiet_tag = "🔇 ТИХИЙ" if getattr(sig, "quiet", False) else "📢 громкий"
     sv = safety.get("verdict", "unknown")
     sv_emoji = {"ok": "✅", "warn": "⚠️", "danger": "⛔", "unknown": "❓"}.get(sv, "❓")
+    insider_tag = " · 🚩инсайдер-концентрация" if safety.get("insider") else ""
     lk = _links(sig.token_mint)
     risks = ", ".join(safety.get("risks", []) or []) or "—"
     info = info or {}
@@ -47,7 +48,7 @@ def format_message(sig: Signal, safety: dict, info: dict | None = None) -> str:
         f"акторы: {', '.join(a[:8] for a in sig.actors)}\n"
         f"объём в окне: ${sig.window_usd:,} · сила: {sig.strength} · набор {getattr(sig, 'first_gap_s', 0):.0f}с\n"
         f"{market_line}"
-        f"safety: {sv_emoji} {sv} ({risks})\n"
+        f"safety: {sv_emoji} {sv} ({risks}){insider_tag}\n"
         f"📈 график: {lk['dexscreener']}\n"
         f"⚡ GMGN: {lk['gmgn']}\n"
         f"⚡ BullX: {lk['bullx']}"
@@ -80,7 +81,7 @@ def deliver(sig: Signal, safety: dict, info: dict | None = None,
     now = datetime.now(timezone.utc).isoformat()
     info = info or {}
     rec = {"ts": now, "signal": asdict(sig), "safety_verdict": safety.get("verdict"),
-           "risks": safety.get("risks"), "market": info}
+           "risks": safety.get("risks"), "insider": safety.get("insider"), "market": info}
     _append(config.OUTPUT_DIR / "signals.log", rec)          # лог ВСЕГДА (для анализа)
     if paper and safety.get("verdict") != "danger":          # PAPER не входим в danger
         _append(config.OUTPUT_DIR / "paper_positions.jsonl",

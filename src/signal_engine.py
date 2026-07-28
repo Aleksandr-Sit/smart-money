@@ -103,9 +103,14 @@ class SignalEngine:
             return None                       # порог не достигнут ИЛИ уже сигналили на этом уровне
         st["last_n"] = n
 
-        strength = round(sum(actors.values()) + total_usd / 1000.0, 2)
-        level = "strong" if n >= self.cfg["STRONG_CONFLUENCE_N"] else "weak"
+        # strength = конвикция акторов + бонус за ТИШИНУ (низкий объём = лучший класс по OOS).
+        # Прежний '+ total_usd/1000' был АНТИ-предиктивен (награждал громкие = убыточные сигналы,
+        # громкие OOS mean −6.5% vs тихие +28%) — заменён на quiet-бонус.
         total_usd_r = round(total_usd)
+        weight_sum = sum(actors.values())
+        quiet_bonus = max(0.0, self.cfg["QUIET_MAX_USD"] - total_usd_r) / 100.0
+        strength = round(weight_sum + quiet_bonus, 2)
+        level = "strong" if n >= self.cfg["STRONG_CONFLUENCE_N"] else "weak"
         return Signal(token_mint=ev.token_mint, ts=ev.ts, actors=list(actors), n_actors=n,
                       window_usd=total_usd_r, strength=strength, level=level,
                       first_buy_ts=st["buys"][0][0],

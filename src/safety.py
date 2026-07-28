@@ -52,10 +52,17 @@ def screen(mint: str, timeout: int = 20, retries: int = 1) -> dict:
         verdict = "warn"
     else:
         verdict = "ok"
+    # concentration red-flag: ТЕКУЩАЯ концентрация холдеров (риск дампа) по рискам RugCheck.
+    # ВНИМАНИЕ: это НЕ валидированный launch-инсайдер-маркер из ресерча (коллапс раннего hold-rate
+    # к ATH) — тот пост-фактум, вживую не считается. RugCheck отражает СНИМОК сейчас (у ANSEM True,
+    # у распределившегося к ATH USWR False). Годится как общий риск-флаг, не как edge-предиктор.
+    _INS = ("holder", "concentrat", "top ", "insider", "supply owned", "single")
+    insider = any(any(k in str(x.get("name", "")).lower() for k in _INS) for x in risks)
     return {
         "verdict": verdict,
         "score": data.get("score_normalised", data.get("score")),
         "risks": [f"{x.get('name')}({x.get('level')})" for x in risks],
+        "insider": insider,
         "raw": data,
     }
 
