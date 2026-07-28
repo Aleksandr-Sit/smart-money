@@ -15,6 +15,8 @@ import requests
 from . import config
 from .signal_engine import Signal
 
+EXIT_FEE = 0.06   # round-trip swap+priority для realized_net (хайркат slippage/реверсии сверх — не логируем)
+
 
 def _links(mint: str) -> dict[str, str]:
     return {
@@ -112,8 +114,12 @@ def format_exit(pos, exit_price: float, reason: str, realized_pnl: float) -> str
 def deliver_exit(pos, exit_price: float, reason: str, telegram: bool = True) -> None:
     now = datetime.now(timezone.utc).isoformat()
     realized = (exit_price / pos.entry_price - 1) if (pos.entry_price and exit_price) else None
+    # realized_pnl — GROSS (историческая совместимость). realized_net — за вычетом round-trip
+    # комиссии (swap+priority ~6%). Хайркат slippage/реверсии/сэндвича вживую не знаем → не в лог.
+    realized_net = (realized - EXIT_FEE) if realized is not None else None
     rec = {"ts": now, "type": "exit", "token_mint": pos.token_mint, "reason": reason,
            "entry_price": pos.entry_price, "exit_price": exit_price, "realized_pnl": realized,
+           "realized_net": realized_net,
            "entry_actors": len(pos.entry_actors), "exited_actors": len(pos.exited_actors),
            "entry_ts": pos.entry_ts, "entry_mc": pos.entry_mc}
     _append(config.OUTPUT_DIR / "signals.log", rec)
