@@ -40,10 +40,14 @@ def format_message(sig: Signal, safety: dict, info: dict | None = None) -> str:
     lk = _links(sig.token_mint)
     risks = ", ".join(safety.get("risks", []) or []) or "—"
     info = info or {}
+    # маркер КАЧЕСТВА входа (аудит-2: MC≥15k+velocity≥40 → win 58% mean +43%, оба time-split >0).
+    # Пока МАРКЕР, не гейт — собираем forward-OOS.
+    quality = (info.get("mc") or 0) >= 15000 and (info.get("buys_h1") or 0) >= 40
+    quality_tag = " ⭐КАЧЕСТВО" if quality else ""
     market_line = ""
     if info:
         market_line = (f"MC {_fmt_usd(info.get('mc'))} · liq {_fmt_usd(info.get('liquidity_usd'))} · "
-                       f"buys(1h) {info.get('buys_h1', '—')} (velocity)\n")
+                       f"buys(1h) {info.get('buys_h1', '—')} (velocity){quality_tag}\n")
     return (
         f"{emoji} CONFLUENCE [{sig.level.upper()}] {quiet_tag} — {sig.n_actors} акторов\n"
         f"token: {sig.token_mint}\n"
@@ -126,6 +130,19 @@ def deliver_exit(pos, exit_price: float, reason: str, telegram: bool = True) -> 
     _append(config.OUTPUT_DIR / "paper_closed.jsonl", rec)
     if telegram:
         send_telegram(format_exit(pos, exit_price, reason, realized if realized is not None else 0.0))
+
+
+def log_actor_sell(token: str, actor: str, price: float | None, ts, pos) -> None:
+    """Лог КАЖДОЙ продажи зашедшего актора по открытой позиции (не только триггерной).
+    Открывает оптимизацию exit-правила: бэктест EXIT_ACTOR_FRAC по фактической
+    последовательности продаж (какой актор по счёту вышел, по какой цене, PnL к тому моменту).
+    """
+    rec = {"ts": ts, "token_mint": token, "actor": actor, "sell_price": price,
+           "entry_price": pos.entry_price, "entry_ts": pos.entry_ts,
+           "n_entry_actors": len(pos.entry_actors),
+           "n_exited_before": len(pos.exited_actors),
+           "pnl_at_sell": (price / pos.entry_price - 1) if (pos.entry_price and price) else None}
+    _append(config.OUTPUT_DIR / "actor_sells.jsonl", rec)
 
 
 def send_heartbeat(text: str) -> bool:

@@ -72,7 +72,11 @@ async def run(max_mc: float, seconds: int | None) -> None:
         # --- ПРОДАЖА: actor-exit ---
         if trade["side"] == "sell":
             actor = amap.get(wallet)
-            if actor and pm.get(token):
+            pos = pm.get(token)
+            if actor and pos and actor[0] in pos.entry_actors and actor[0] not in pos.exited_actors:
+                # лог КАЖДОЙ новой продажи зашедшего актора (до on_sell) — для оптимизации exit-правила
+                await loop.run_in_executor(None, delivery.log_actor_sell,
+                                           token, actor[0], price, trade.get("ts"), pos)
                 reason = pm.on_sell(token, actor[0])
                 if reason:
                     await emit_exit(token, price or 0.0, reason)
