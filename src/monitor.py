@@ -17,6 +17,7 @@ from . import delivery, helius, helius_ws, market, positions, price_track, safet
 from .signal_engine import BuyEvent, SignalEngine, load_actor_map
 
 HEARTBEAT_S = 6 * 3600
+MAX_POSITIONS = 5      # лимит одновр. позиций (капитал-replay: 5 без потерь, 3 ≈ 18/19 хвостов)
 SEEN_MAX = 100_000
 
 
@@ -109,12 +110,16 @@ async def run(max_mc: float, seconds: int | None) -> None:
             stats["quiet"] += 1
         if alert:
             stats["alerts"] += 1
-        if saf.get("verdict") != "danger":
+        # капитал-лимит: бот держит ≤MAX_POSITIONS слотов (replay: 3-5 = edge без потерь,
+        # медиана удержания 5.9 мин → низкая конкуренция). Реализм: не открываем сверх лимита.
+        at_cap = len(pm.open_tokens()) >= MAX_POSITIONS
+        if saf.get("verdict") != "danger" and not at_cap:
             if pm.open(token, info.get("price_usd"), info.get("mc"), signal.actors, ev.ts):
                 stats["opens"] += 1
         print(f"[SIGNAL {signal.level}{'/quiet' if signal.quiet else ''}] {token} "
               f"n_actors={signal.n_actors} usd=${signal.window_usd} MC=${(mc or 0):,.0f} "
-              f"safety={saf.get('verdict')} tg={alert} open={len(pm.open_tokens())}")
+              f"safety={saf.get('verdict')} tg={alert} open={len(pm.open_tokens())}"
+              f"{' [CAP]' if at_cap else ''}")
 
     async def heartbeat() -> None:
         def _rpc_alive() -> str:
