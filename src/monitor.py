@@ -14,7 +14,8 @@ import asyncio
 import time
 from collections import deque
 
-from . import delivery, helius, helius_ws, market, positions, price_track, safety, strategy, tx_parse
+from . import (delivery, execution, helius, helius_ws, market, positions, price_track,
+               safety, strategy, tx_parse)
 from .signal_engine import BuyEvent, SignalEngine, load_actor_map
 
 HEARTBEAT_S = 6 * 3600
@@ -38,10 +39,26 @@ async def run(max_mc: float, seconds: int | None) -> None:
              "started": time.time(), "last_signal_ts": time.time()}
     loop = asyncio.get_event_loop()
 
+    async def shadow(token: str, phase: str) -> None:
+        """SHADOW-замер фрикции (только котировки, ничего не отправляется). Фаза B."""
+        if not strategy.EXECUTION["SHADOW_ENABLED"]:
+            return
+        try:
+            r = await loop.run_in_executor(None, execution.measure_and_log, token, phase, None)
+            if r.get("routable"):
+                print(f"[SHADOW {phase}] {token[:12]} фрикция {r['roundtrip_friction']:+.2%} "
+                      f"итого {r['total_cost']:.2%}")
+            else:
+                print(f"[SHADOW {phase}] {token[:12]} НЕ РОУТИТСЯ: {r.get('error')}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[shadow] fail {token[:8]}: {type(e).__name__}")
+
     async def emit_exit(token: str, exit_price: float, reason: str) -> None:
         p = pm.get(token)
         if not p:
             return
+        # замер фрикции В МОМЕНТ ВЫХОДА — ловит тонкую книгу при дампе (стресс-кейс)
+        await shadow(token, f"exit_{reason}")
         await loop.run_in_executor(None, delivery.deliver_exit, p, exit_price, reason, True)
         r = positions.total_realized(p, exit_price)   # с учётом частичных тейков
         print(f"[EXIT {reason}] {token} realized={r:+.0%} (частичн {p.realized:+.0%}+ост {p.remaining:.2f})")
@@ -126,6 +143,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
         if saf.get("verdict") != "danger" and not at_cap:
             if pm.open(token, info.get("price_usd"), info.get("mc"), signal.actors, ev.ts):
                 stats["opens"] += 1
+                await shadow(token, "entry")      # фрикция на входе (Фаза B)
         print(f"[SIGNAL {signal.level}{'/quiet' if signal.quiet else ''}] {token} "
               f"n_actors={signal.n_actors} usd=${signal.window_usd} MC=${(mc or 0):,.0f} "
               f"safety={saf.get('verdict')} tg={alert} open={len(pm.open_tokens())}"

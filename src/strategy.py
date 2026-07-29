@@ -26,6 +26,7 @@ _REQUIRED = {
     "alerts": ["QUALITY_MIN_MC", "QUALITY_MIN_VELOCITY", "SANITY_JUMP",
                "STALE_SIGNAL_H", "MAX_ANOMALY_RATE"],
     "tracking": ["TICK_S", "TRACK_S"],
+    "execution": ["SHADOW_CLIP_USD", "SLIPPAGE_BPS", "SHADOW_ENABLED"],
 }
 
 
@@ -81,10 +82,11 @@ EXIT = CFG["exit"]
 RISK = CFG["risk"]
 ALERTS = CFG["alerts"]
 TRACKING = CFG["tracking"]
+EXECUTION = CFG["execution"]
 
 
 if __name__ == "__main__":
     print(f"strategy.yaml OK — version {VERSION}")
     for name, sec in (("signal", SIGNAL), ("exit", EXIT), ("risk", RISK),
-                      ("alerts", ALERTS), ("tracking", TRACKING)):
+                      ("alerts", ALERTS), ("tracking", TRACKING), ("execution", EXECUTION)):
         print(f"  {name}: {sec}")
