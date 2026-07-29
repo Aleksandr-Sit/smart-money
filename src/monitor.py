@@ -42,8 +42,8 @@ async def run(max_mc: float, seconds: int | None) -> None:
         if not p:
             return
         await loop.run_in_executor(None, delivery.deliver_exit, p, exit_price, reason, True)
-        r = (exit_price / p.entry_price - 1) if (p.entry_price and exit_price) else None
-        print(f"[EXIT {reason}] {token} realized={r:+.0%}" if r is not None else f"[EXIT {reason}] {token}")
+        r = positions.total_realized(p, exit_price)   # с учётом частичных тейков
+        print(f"[EXIT {reason}] {token} realized={r:+.0%} (частичн {p.realized:+.0%}+ост {p.remaining:.2f})")
         stats["exits"] += 1
         pm.close(token)
 
@@ -103,9 +103,12 @@ async def run(max_mc: float, seconds: int | None) -> None:
         except Exception as e:  # noqa: BLE001
             print(f"[track] register fail {token[:8]}: {type(e).__name__}")
         saf = await loop.run_in_executor(None, safety.screen, token)
-        # Telegram — ТОЛЬКО лучший класс: strong + ТИХИЙ + safety ok/warn (ресерч: quiet +38.7% OOS).
-        # Лог и paper пишут ВСЕ сигналы (нужен знаменатель + продолжение OOS по обеим группам).
-        alert = signal.level == "strong" and signal.quiet and saf.get("verdict") in ("ok", "warn")
+        # Telegram — лучшие классы: strong + safety ok/warn + (ТИХИЙ | КАЧЕСТВО-моментум).
+        # Аудит-3: quiet и quality — 2 непересекающиеся положительные оси (quiet mean +22%,
+        # quality MC≥15k+vel≥40 win 58% mean +43%, обе робастны). Оба шлём в Telegram.
+        quality = (info.get("mc") or 0) >= 15000 and (info.get("buys_h1") or 0) >= 40
+        alert = (signal.level == "strong" and saf.get("verdict") in ("ok", "warn")
+                 and (signal.quiet or quality))
         await loop.run_in_executor(None, delivery.deliver, signal, saf, info, True, alert)
         stats["signals"] += 1
         if signal.level == "strong":
@@ -154,9 +157,14 @@ async def run(max_mc: float, seconds: int | None) -> None:
                 continue
             cur = prices.get(token)
             age_h = (time.time() - p.entry_ts) / 3600
-            reason = pm.check_price(token, cur, age_h)
-            if reason:
-                await emit_exit(token, cur or 0.0, reason)
+            res = pm.check_price(token, cur, age_h)
+            if not res:
+                continue
+            if res["action"] == "partial":        # частичный тейк — позиция продолжается
+                await loop.run_in_executor(None, delivery.log_partial, p, cur, res["frac"])
+                print(f"[PARTIAL {res['reason']}] {token} frac={res['frac']:.2f} rem={p.remaining:.2f}")
+            else:
+                await emit_exit(token, cur or 0.0, res["reason"])
 
     batches = _split(wallets, 5)
     print(f"[monitor] {len(wallets)} кошельков, {len(batches)} WS-соединений, "

@@ -14,9 +14,12 @@ from . import config
 
 EXIT_CFG = {
     "EXIT_ACTOR_FRAC": 0.5,   # вышло >= доли зашедших акторов → exit
-    "TP_MULT": 6.0,           # тейк-профит: grid по 522 траекториям — 2.5x резал победителей,
-    "SL_MULT": 0.5,           # TP=6 доминирует во всех срезах; рабочий выход = трейлинг
-    "TRAIL": 0.35,            # трейлинг: падение от пика на эту долю
+    # ЧАСТИЧНЫЙ выход (аудит-3: тактика H самая робастная — обе половины time-split >0,
+    # мин. дисперсия, лучшая стойкость к хайркату). Фиксируем долю на каждом уровне мультипликатора.
+    "PARTIAL_TAKES": [(2.0, 0.5)],   # [(mult, доля)] — продать 0.5 позиции на 2x
+    "TP_MULT": 6.0,           # финальный тейк остатка (grid: 6x доминирует)
+    "SL_MULT": 0.5,           # стоп остатка
+    "TRAIL": 0.35,            # трейлинг остатка: падение от пика на эту долю
     "TRAIL_ARM": 1.5,         # трейлинг включается после роста >= этого × entry
     "DEAD_AGE_H": 1.0,        # нет данных дольше → мёртвый (-100%)
     "MAX_HOLD_S": 1800,       # max-hold таймаут (== replay); дольше не держим (иначе рассинхрон с валидацией)
@@ -32,6 +35,18 @@ class Position:
     entry_actors: list[str]
     peak_price: float
     exited_actors: list[str] = field(default_factory=list)
+    remaining: float = 1.0                        # непроданная доля позиции
+    realized: float = 0.0                         # накопл. реализ. вклад = сумма frac*(mult-1)
+    taken: list[int] = field(default_factory=list)  # индексы взятых частичных тейков
+
+
+def total_realized(p: Position, exit_price: float | None) -> float:
+    """Итоговый PnL позиции: уже реализованное + остаток по цене выхода (dead/None = -остаток)."""
+    if exit_price and p.entry_price:
+        tail = p.remaining * (exit_price / p.entry_price - 1)
+    else:
+        tail = p.remaining * -1.0
+    return p.realized + tail
 
 
 class PositionManager:
@@ -72,28 +87,43 @@ class PositionManager:
             return "actors_exit"
         return None
 
-    def check_price(self, token: str, cur_price: float | None, age_h: float) -> str | None:
-        """Проверка ценовых правил. Обновляет peak. → причина выхода или None."""
+    def check_price(self, token: str, cur_price: float | None, age_h: float) -> dict | None:
+        """Проверка ценовых правил с ЧАСТИЧНЫМИ тейками. Обновляет peak/remaining/realized.
+
+        → None | {"action":"partial","reason":...,"frac":x} (позиция продолжается с меньшим остатком)
+              | {"action":"close","reason":...}             (закрыть остаток).
+        Порядок как в replay: частичные тейки → TP/SL/trail остатка → таймаут → dead.
+        """
         p = self.pos.get(token)
         if not p:
             return None
-        # порядок правил == replay: сначала ценовые (TP/SL/trail), потом таймаут, потом dead
         if cur_price is not None:
             if cur_price > p.peak_price:
                 p.peak_price = cur_price
                 self._save()
             mult = cur_price / p.entry_price if p.entry_price else 0
+            # частичные тейки: продать долю на достигнутом уровне (позиция продолжается)
+            for i, (tm, fr) in enumerate(self.cfg["PARTIAL_TAKES"]):
+                if i not in p.taken and mult >= tm and p.remaining > 1e-9:
+                    sell = min(fr, p.remaining)
+                    p.realized += sell * (mult - 1)
+                    p.remaining -= sell
+                    p.taken.append(i)
+                    self._save()
+                    if p.remaining <= 1e-9:
+                        return {"action": "close", "reason": "take_profit"}
+                    return {"action": "partial", "reason": "take_partial", "frac": sell}
             if mult >= self.cfg["TP_MULT"]:
-                return "take_profit"
+                return {"action": "close", "reason": "take_profit"}
             if mult <= self.cfg["SL_MULT"]:
-                return "stop_loss"
+                return {"action": "close", "reason": "stop_loss"}
             peak_mult = p.peak_price / p.entry_price if p.entry_price else 0
             if peak_mult >= self.cfg["TRAIL_ARM"] and cur_price <= p.peak_price * (1 - self.cfg["TRAIL"]):
-                return "trailing"
-        if age_h * 3600 >= self.cfg["MAX_HOLD_S"]:   # таймаут == replay (не держим дольше валидации)
-            return "timeout"
+                return {"action": "close", "reason": "trailing"}
+        if age_h * 3600 >= self.cfg["MAX_HOLD_S"]:
+            return {"action": "close", "reason": "timeout"}
         if cur_price is None:
-            return "dead" if age_h > self.cfg["DEAD_AGE_H"] else None
+            return {"action": "close", "reason": "dead"} if age_h > self.cfg["DEAD_AGE_H"] else None
         return None
 
     def close(self, token: str) -> Position | None:
@@ -109,20 +139,27 @@ class PositionManager:
         return self.pos.get(token)
 
 
-if __name__ == "__main__":   # самотест логики выходов
+if __name__ == "__main__":   # самотест логики выходов (частичные тейки)
     import os
     f = config.OUTPUT_DIR / "open_positions.json"
     if f.exists():
         os.remove(f)
     pm = PositionManager()
-    print("open:", pm.open("TOK", 0.001, 1_000_000, ["a1", "a2", "a3"], 1000))
-    print("sell a1 (1/3 < 50%):", pm.on_sell("TOK", "a1"))
-    print("sell a2 (2/3 >= 50%):", pm.on_sell("TOK", "a2"))
-    print("reload persist:", PositionManager().open_tokens())
-    print("TP (3x):", pm.check_price("TOK", 0.003, 0.1))
-    print("SL (0.4x):", pm.check_price("TOK", 0.0004, 0.1))
-    pm.check_price("TOK", 0.002, 0.1)                      # взводим peak на 2x
-    print("trailing (0.0012 vs peak 0.002):", pm.check_price("TOK", 0.0012, 0.1))
-    print("timeout (age 2ч > max-hold 0.5ч):", pm.check_price("TOK", None, 2.0))
+    pm.open("TOK", 0.001, 1_000_000, ["a1", "a2"], 1000)    # entry 0.001
+    print("partial 50%@2x (цена 0.002):", pm.check_price("TOK", 0.002, 0.1))
+    pos = pm.get("TOK")
+    print(f"  → remaining={pos.remaining} realized={pos.realized} (ожид 0.5 / 0.5)")
+    print("нет 2-го тейка ниже 2x (0.0018):", pm.check_price("TOK", 0.0018, 0.1))
+    print("close остатка по TP6 (0.006):", pm.check_price("TOK", 0.006, 0.1))
+    print(f"  total_realized при выходе 0.006: {total_realized(pos, 0.006):+.2f} (ожид 0.5+0.5*5=3.0)")
+
+    if f.exists():
+        os.remove(f)
+    pm = PositionManager()
+    pm.open("T2", 0.001, 1e6, ["a1", "a2"], 1000)
+    print("\nSL остатка (0.0004) без тейка:", pm.check_price("T2", 0.0004, 0.1))
+    print(f"  total_realized при SL 0.0004: {total_realized(pm.get('T2'), 0.0004):+.2f} (ожид -0.6)")
+    print("actor-exit a1 (1/2>=50%):", pm.on_sell("T2", "a1"))
+    print("timeout без цены age2ч:", pm.check_price("T2", None, 2.0))
     if f.exists():
         os.remove(f)

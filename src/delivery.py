@@ -117,19 +117,29 @@ def format_exit(pos, exit_price: float, reason: str, realized_pnl: float) -> str
 
 def deliver_exit(pos, exit_price: float, reason: str, telegram: bool = True) -> None:
     now = datetime.now(timezone.utc).isoformat()
-    realized = (exit_price / pos.entry_price - 1) if (pos.entry_price and exit_price) else None
-    # realized_pnl — GROSS (историческая совместимость). realized_net — за вычетом round-trip
-    # комиссии (swap+priority ~6%). Хайркат slippage/реверсии/сэндвича вживую не знаем → не в лог.
-    realized_net = (realized - EXIT_FEE) if realized is not None else None
+    from .positions import total_realized
+    # итоговый GROSS PnL с учётом ЧАСТИЧНЫХ тейков (реализованное + остаток по цене выхода)
+    realized = total_realized(pos, exit_price)
+    realized_net = realized - EXIT_FEE          # round-trip swap+priority ~6% (хайркат — не логируем)
     rec = {"ts": now, "type": "exit", "token_mint": pos.token_mint, "reason": reason,
            "entry_price": pos.entry_price, "exit_price": exit_price, "realized_pnl": realized,
-           "realized_net": realized_net,
+           "realized_net": realized_net, "realized_partial": pos.realized, "remaining": pos.remaining,
            "entry_actors": len(pos.entry_actors), "exited_actors": len(pos.exited_actors),
            "entry_ts": pos.entry_ts, "entry_mc": pos.entry_mc}
     _append(config.OUTPUT_DIR / "signals.log", rec)
     _append(config.OUTPUT_DIR / "paper_closed.jsonl", rec)
     if telegram:
         send_telegram(format_exit(pos, exit_price, reason, realized if realized is not None else 0.0))
+
+
+def log_partial(pos, price: float | None, frac: float) -> None:
+    """Лог частичного тейка (позиция продолжается с меньшим остатком)."""
+    now = datetime.now(timezone.utc).isoformat()
+    mult = (price / pos.entry_price) if (price and pos.entry_price) else None
+    _append(config.OUTPUT_DIR / "paper_closed.jsonl",
+            {"ts": now, "type": "partial", "token_mint": pos.token_mint, "frac": frac,
+             "mult": mult, "remaining": pos.remaining, "realized_partial": pos.realized,
+             "entry_ts": pos.entry_ts})
 
 
 def log_actor_sell(token: str, actor: str, price: float | None, ts, pos) -> None:
