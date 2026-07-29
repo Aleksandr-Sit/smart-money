@@ -29,8 +29,17 @@ def _load_last_sol() -> float:
 _sol_cache = {"price": _load_last_sol(), "ts": 0.0}
 
 
-def _best_pair(pairs: list[dict]) -> dict | None:
+def _best_pair(pairs: list[dict], mint: str | None = None) -> dict | None:
+    """Самая ликвидная пара, где НАШ токен — базовый.
+
+    КРИТИЧНО (баг найден в аудите-4): без проверки baseToken DexScreener может отдать пару,
+    где наш mint — котируемый (или вообще другой токен), и priceUsd тогда = цена ЧУЖОГО
+    токена. Один такой случай дал фиктивные +321645% (цена завышена в 3217x) и 81% всей
+    суммы PnL в paper. Пары не по нашему mint отбрасываем.
+    """
     pairs = [p for p in pairs if (p.get("liquidity") or {}).get("usd")]
+    if mint:
+        pairs = [p for p in pairs if (p.get("baseToken") or {}).get("address") == mint]
     return max(pairs, key=lambda x: x["liquidity"]["usd"]) if pairs else None
 
 
@@ -62,7 +71,7 @@ def token_info(mint: str) -> dict:
     """DexScreener по токену: mc, price_usd, liquidity, buys/sells h1 (velocity), возраст."""
     try:
         r = requests.get(f"{DS}/{mint}", timeout=10).json()
-        p = _best_pair(r.get("pairs") or [])
+        p = _best_pair(r.get("pairs") or [], mint)      # только пары, где baseToken == наш mint
         if not p:
             return {}
         h1 = (p.get("txns") or {}).get("h1") or {}

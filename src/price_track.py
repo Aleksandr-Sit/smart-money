@@ -97,8 +97,11 @@ def parse_curve(data: bytes) -> dict | None:
 class PriceTracker:
     """register(mint, price0) при сигнале; run() — фоновый цикл, пишет price_history.jsonl."""
 
+    SANITY_JUMP = 50.0       # скачок цены больше этого между тиками = мусор источника, не рынок
+
     def __init__(self):
         self.active: dict[str, dict] = {}   # mint -> {pda, t0}
+        self.last: dict[str, float] = {}    # последняя валидная цена (санитарный фильтр)
         self.path = config.OUTPUT_DIR / HISTORY
 
     def _append(self, row: dict) -> None:
@@ -144,6 +147,16 @@ class PriceTracker:
                     if info.get("price_usd"):
                         row = {"ts": now, "mint": m, "price_usd": info["price_usd"], "src": "dex"}
                 if row:
+                    # санитарный фильтр: невозможный скачок (баг источника, см. аудит-4 —
+                    # DexScreener отдавал цену чужого токена → фиктивные +321645%)
+                    prev = self.last.get(m)
+                    if prev and prev > 0:
+                        ratio = row["price_usd"] / prev
+                        if ratio > self.SANITY_JUMP or ratio < 1 / self.SANITY_JUMP:
+                            print(f"[track] SKIP аномалия {m[:8]}: {prev:.3e}->{row['price_usd']:.3e} "
+                                  f"({ratio:.0f}x, src={row['src']})")
+                            continue
+                    self.last[m] = row["price_usd"]
                     rows.append(row)
         for r in rows:
             self._append(r)
