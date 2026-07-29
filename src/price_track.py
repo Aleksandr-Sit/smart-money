@@ -22,11 +22,12 @@ import struct
 import time
 from hashlib import sha256
 
-from . import config, helius, market
+from . import config, helius, market, strategy
 
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-TICK_S = 15            # период опроса (все токены одним батчем)
-TRACK_S = 45 * 60      # сколько вести токен после сигнала
+# Единый конфиг (аудит-4). TICK_S — не деталь, а ЧАСТЬ СТРАТЕГИИ: на 90с edge исчезал.
+TICK_S = strategy.TRACKING["TICK_S"]
+TRACK_S = strategy.TRACKING["TRACK_S"]
 HISTORY = "price_history.jsonl"
 
 # ---------- base58 (pure python, без зависимостей) ----------
@@ -97,11 +98,13 @@ def parse_curve(data: bytes) -> dict | None:
 class PriceTracker:
     """register(mint, price0) при сигнале; run() — фоновый цикл, пишет price_history.jsonl."""
 
-    SANITY_JUMP = 50.0       # скачок цены больше этого между тиками = мусор источника, не рынок
+    SANITY_JUMP = strategy.ALERTS["SANITY_JUMP"]   # скачок больше этого = мусор источника (аудит-4)
 
     def __init__(self):
         self.active: dict[str, dict] = {}   # mint -> {pda, t0}
         self.last: dict[str, float] = {}    # последняя валидная цена (санитарный фильтр)
+        self.anomalies = 0                  # счётчик отбитых аномалий → алерт качества данных
+        self.rpc_fails = 0
         self.path = config.OUTPUT_DIR / HISTORY
 
     def _append(self, row: dict) -> None:
@@ -133,6 +136,7 @@ class PriceTracker:
                                  [[self.active[m]["pda"] for m in chunk],
                                   {"encoding": "base64"}]).get("result", {}).get("value") or []
             except Exception as e:  # noqa: BLE001
+                self.rpc_fails += 1
                 print(f"[track] rpc fail: {type(e).__name__}")
                 continue
             for m, acc in zip(chunk, res):
@@ -153,6 +157,7 @@ class PriceTracker:
                     if prev and prev > 0:
                         ratio = row["price_usd"] / prev
                         if ratio > self.SANITY_JUMP or ratio < 1 / self.SANITY_JUMP:
+                            self.anomalies += 1
                             print(f"[track] SKIP аномалия {m[:8]}: {prev:.3e}->{row['price_usd']:.3e} "
                                   f"({ratio:.0f}x, src={row['src']})")
                             continue

@@ -10,20 +10,10 @@ import math
 import time
 from dataclasses import asdict, dataclass, field
 
-from . import config
+from . import config, strategy
 
-EXIT_CFG = {
-    "EXIT_ACTOR_FRAC": 0.5,   # вышло >= доли зашедших акторов → exit
-    # ЧАСТИЧНЫЙ выход (аудит-3: тактика H самая робастная — обе половины time-split >0,
-    # мин. дисперсия, лучшая стойкость к хайркату). Фиксируем долю на каждом уровне мультипликатора.
-    "PARTIAL_TAKES": [(2.0, 0.5)],   # [(mult, доля)] — продать 0.5 позиции на 2x
-    "TP_MULT": 6.0,           # финальный тейк остатка (grid: 6x доминирует)
-    "SL_MULT": 0.5,           # стоп остатка
-    "TRAIL": 0.35,            # трейлинг остатка: падение от пика на эту долю
-    "TRAIL_ARM": 1.5,         # трейлинг включается после роста >= этого × entry
-    "DEAD_AGE_H": 1.0,        # нет данных дольше → мёртвый (-100%)
-    "MAX_HOLD_S": 1800,       # max-hold таймаут (== replay); дольше не держим (иначе рассинхрон с валидацией)
-}
+# Правила выхода — из ЕДИНОГО источника config/strategy.yaml (аудит-4).
+EXIT_CFG = dict(strategy.EXIT)
 
 
 @dataclass

@@ -1,8 +1,9 @@
 """Контур 2 — оркестратор live-мониторинга (вход + ГИБРИДНЫЙ выход).
 
 Вход: WS → parse_trade(buy) → движок конфлюенса → safety → доставка + открытие позиции.
-Выход (гибрид): (1) actor-exit — зашедший актор продаёт трекаемый токен; (2) price — TP/SL/
-trailing/dead (фоновый цикл каждые ~90с). Что сработает первым → EXIT + realized PnL.
+Выход (гибрид): (1) actor-exit — зашедший актор продаёт трекаемый токен; (2) price — частичные
+тейки + TP/SL/trailing/timeout на 15с-цикле трекера (на 90с edge исчезал, аудит-3).
+Что сработает первым → PARTIAL или EXIT + realized PnL. Параметры — config/strategy.yaml.
 
 Run:  .venv\\Scripts\\python.exe -m src.monitor [--max-mc 2000000] [--seconds N]
 """
@@ -13,11 +14,11 @@ import asyncio
 import time
 from collections import deque
 
-from . import delivery, helius, helius_ws, market, positions, price_track, safety, tx_parse
+from . import delivery, helius, helius_ws, market, positions, price_track, safety, strategy, tx_parse
 from .signal_engine import BuyEvent, SignalEngine, load_actor_map
 
 HEARTBEAT_S = 6 * 3600
-MAX_POSITIONS = 5      # лимит одновр. позиций (капитал-replay: 5 без потерь, 3 ≈ 18/19 хвостов)
+MAX_POSITIONS = strategy.RISK["MAX_POSITIONS"]   # единый конфиг (капитал-replay: 5 без потерь)
 SEEN_MAX = 100_000
 
 
@@ -34,7 +35,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
     seen_sigs: set[str] = set()
     seen_order: deque[str] = deque()      # FIFO-эвикция: не сбрасываем дедуп разом
     stats = {"signals": 0, "strong": 0, "quiet": 0, "alerts": 0, "opens": 0, "exits": 0,
-             "started": time.time()}
+             "started": time.time(), "last_signal_ts": time.time()}
     loop = asyncio.get_event_loop()
 
     async def emit_exit(token: str, exit_price: float, reason: str) -> None:
@@ -106,11 +107,13 @@ async def run(max_mc: float, seconds: int | None) -> None:
         # Telegram — лучшие классы: strong + safety ok/warn + (ТИХИЙ | КАЧЕСТВО-моментум).
         # Аудит-3: quiet и quality — 2 непересекающиеся положительные оси (quiet mean +22%,
         # quality MC≥15k+vel≥40 win 58% mean +43%, обе робастны). Оба шлём в Telegram.
-        quality = (info.get("mc") or 0) >= 15000 and (info.get("buys_h1") or 0) >= 40
+        quality = ((info.get("mc") or 0) >= strategy.ALERTS["QUALITY_MIN_MC"]
+                   and (info.get("buys_h1") or 0) >= strategy.ALERTS["QUALITY_MIN_VELOCITY"])
         alert = (signal.level == "strong" and saf.get("verdict") in ("ok", "warn")
                  and (signal.quiet or quality))
         await loop.run_in_executor(None, delivery.deliver, signal, saf, info, True, alert)
         stats["signals"] += 1
+        stats["last_signal_ts"] = time.time()      # для алерта «поток иссяк»
         if signal.level == "strong":
             stats["strong"] += 1
         if signal.quiet:
@@ -139,14 +142,31 @@ async def run(max_mc: float, seconds: int | None) -> None:
         await loop.run_in_executor(None, delivery.send_heartbeat,
                                    f"монитор запущен · {len(wallets)} кош./{len(batches)} WS · "
                                    f"SOL=${market.sol_price():.2f} · открытых={len(pm.open_tokens())}")
+        prev_anom = 0
         while True:
             await asyncio.sleep(HEARTBEAT_S)
             up_h = (time.time() - stats["started"]) / 3600
-            msg = (f"жив {up_h:.0f}ч · сигналов={stats['signals']} "
+            msg = (f"жив {up_h:.0f}ч · v{strategy.VERSION} · сигналов={stats['signals']} "
                    f"(strong={stats['strong']} тихих={stats['quiet']} алертов={stats['alerts']}) · "
                    f"входов={stats['opens']} выходов={stats['exits']} · открытых={len(pm.open_tokens())} · "
-                   f"трек={len(tracker.active)} · SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}")
+                   f"трек={len(tracker.active)} · аном={tracker.anomalies} · "
+                   f"SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}")
             await loop.run_in_executor(None, delivery.send_heartbeat, msg)
+
+            # --- контроль качества данных и потока (аудит-4) ---
+            problems = []
+            new_anom = tracker.anomalies - prev_anom
+            prev_anom = tracker.anomalies
+            if new_anom > strategy.ALERTS["MAX_ANOMALY_RATE"]:
+                problems.append(f"аномалий цены за период: {new_anom} — источник врёт?")
+            silence_h = (time.time() - stats["last_signal_ts"]) / 3600
+            if silence_h > strategy.ALERTS["STALE_SIGNAL_H"]:
+                problems.append(f"нет сигналов {silence_h:.1f}ч — поток иссяк / WS молчит?")
+            if tracker.rpc_fails > 0:
+                problems.append(f"RPC-сбоев трекера: {tracker.rpc_fails}")
+                tracker.rpc_fails = 0
+            if problems:
+                await loop.run_in_executor(None, delivery.send_alert, " · ".join(problems))
 
     async def exit_tick(prices: dict) -> None:
         """Выходы на 15с-цикле трекера (было 90с — на такой гранулярности edge исчезал, см. аудит).

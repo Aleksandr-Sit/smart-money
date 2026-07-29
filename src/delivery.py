@@ -12,10 +12,10 @@ from datetime import datetime, timezone
 
 import requests
 
-from . import config
+from . import config, strategy
 from .signal_engine import Signal
 
-EXIT_FEE = 0.06   # round-trip swap+priority для realized_net (хайркат slippage/реверсии сверх — не логируем)
+EXIT_FEE = strategy.RISK["EXIT_FEE"]   # round-trip swap+priority для realized_net (единый конфиг)
 
 
 def _links(mint: str) -> dict[str, str]:
@@ -40,9 +40,10 @@ def format_message(sig: Signal, safety: dict, info: dict | None = None) -> str:
     lk = _links(sig.token_mint)
     risks = ", ".join(safety.get("risks", []) or []) or "—"
     info = info or {}
-    # маркер КАЧЕСТВА входа (аудит-2: MC≥15k+velocity≥40 → win 58% mean +43%, оба time-split >0).
-    # Пока МАРКЕР, не гейт — собираем forward-OOS.
-    quality = (info.get("mc") or 0) >= 15000 and (info.get("buys_h1") or 0) >= 40
+    # маркер КАЧЕСТВА входа. ВНИМАНИЕ (аудит-4): робастен только на live-исходах, на
+    # траекториях затухает (1пол +43.7% → 2пол +7.8%) → МАРКЕР, не гейт. Пороги — из конфига.
+    quality = ((info.get("mc") or 0) >= strategy.ALERTS["QUALITY_MIN_MC"]
+               and (info.get("buys_h1") or 0) >= strategy.ALERTS["QUALITY_MIN_VELOCITY"])
     quality_tag = " ⭐КАЧЕСТВО" if quality else ""
     market_line = ""
     if info:
@@ -86,7 +87,8 @@ def deliver(sig: Signal, safety: dict, info: dict | None = None,
             paper: bool = True, telegram: bool = True) -> None:
     now = datetime.now(timezone.utc).isoformat()
     info = info or {}
-    rec = {"ts": now, "signal": asdict(sig), "safety_verdict": safety.get("verdict"),
+    rec = {"ts": now, "strategy_version": strategy.VERSION,   # каким конфигом порождён сигнал
+           "signal": asdict(sig), "safety_verdict": safety.get("verdict"),
            "risks": safety.get("risks"), "insider": safety.get("insider"), "market": info}
     _append(config.OUTPUT_DIR / "signals.log", rec)          # лог ВСЕГДА (для анализа)
     if paper and safety.get("verdict") != "danger":          # PAPER не входим в danger
@@ -121,7 +123,8 @@ def deliver_exit(pos, exit_price: float, reason: str, telegram: bool = True) -> 
     # итоговый GROSS PnL с учётом ЧАСТИЧНЫХ тейков (реализованное + остаток по цене выхода)
     realized = total_realized(pos, exit_price)
     realized_net = realized - EXIT_FEE          # round-trip swap+priority ~6% (хайркат — не логируем)
-    rec = {"ts": now, "type": "exit", "token_mint": pos.token_mint, "reason": reason,
+    rec = {"ts": now, "type": "exit", "strategy_version": strategy.VERSION,
+           "token_mint": pos.token_mint, "reason": reason,
            "entry_price": pos.entry_price, "exit_price": exit_price, "realized_pnl": realized,
            "realized_net": realized_net, "realized_partial": pos.realized, "remaining": pos.remaining,
            "entry_actors": len(pos.entry_actors), "exited_actors": len(pos.exited_actors),
@@ -158,6 +161,11 @@ def log_actor_sell(token: str, actor: str, price: float | None, ts, pos) -> None
 def send_heartbeat(text: str) -> bool:
     """Пульс: подтверждает, что монитор жив. Тишина в Telegram ≠ 'нет сигналов'."""
     return send_telegram("💓 " + text)
+
+
+def send_alert(text: str) -> bool:
+    """Алерт качества данных/потока. Баг цены (аудит-4) жил недели незамеченным — больше нет."""
+    return send_telegram("⚠️ АЛЕРТ: " + text)
 
 
 def _demo() -> None:

@@ -13,20 +13,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config
+from . import config, strategy
 
-DEFAULTS = {
-    "CONFLUENCE_N": 2,          # разных акторов для сигнала
-    "STRONG_CONFLUENCE_N": 3,   # порог strong
-    "CONFLUENCE_WINDOW_S": 600,  # окно схождения, сек
-    "SIGNAL_MAX_MC_USD": 100_000,   # токен ещё ранний
-    "SIGNAL_MAX_AGE_S": 3600,       # возраст токена <= 1ч
-    "SIGNAL_MIN_USD": 20,           # не пыль
-    # «тихий конфлюенс»: малый суммарный объём в окне = ранняя органическая фаза (не FOMO-пик).
-    # Порог $250 из train-only разреза (5-дневный ресерч): quiet-сигналы на OOS дали mean +38.7%,
-    # sum-top3 +110%, «громкие» −23.6%. ПРОВИЗОРНЫЙ — калибровать вторым OOS-периодом.
-    "QUIET_MAX_USD": 250,
-}
+# Параметры входа — из ЕДИНОГО источника config/strategy.yaml (аудит-4: были разбросаны).
+DEFAULTS = dict(strategy.SIGNAL)
 
 
 @dataclass
