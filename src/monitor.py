@@ -14,8 +14,8 @@ import asyncio
 import time
 from collections import deque
 
-from . import (delivery, execution, helius, helius_ws, market, positions, price_track,
-               safety, strategy, tx_parse)
+from . import (delivery, execution, helius, helius_ws, ledger, market, positions, price_track,
+               risk, safety, strategy, tx_parse)
 from .signal_engine import BuyEvent, SignalEngine, load_actor_map
 
 HEARTBEAT_S = 6 * 3600
@@ -33,8 +33,10 @@ async def run(max_mc: float, seconds: int | None) -> None:
     engine = SignalEngine(amap)
     pm = positions.PositionManager()
     tracker = price_track.PriceTracker()
+    rm = risk.RiskManager()          # Фаза C: дневной стоп / kill-switch / экспозиция
     seen_sigs: set[str] = set()
     seen_order: deque[str] = deque()      # FIFO-эвикция: не сбрасываем дедуп разом
+    pos_intent: dict[str, str] = {}       # token -> id намерения в леджере
     stats = {"signals": 0, "strong": 0, "quiet": 0, "alerts": 0, "opens": 0, "exits": 0,
              "started": time.time(), "last_signal_ts": time.time()}
     loop = asyncio.get_event_loop()
@@ -84,6 +86,19 @@ async def run(max_mc: float, seconds: int | None) -> None:
         r = positions.total_realized(p, exit_price)   # с учётом частичных тейков
         print(f"[EXIT {reason}] {token} realized={r:+.0%} (частичн {p.realized:+.0%}+ост {p.remaining:.2f})")
         stats["exits"] += 1
+        # леджер (независимый учёт в деньгах) + риск-менеджер (дневной стоп)
+        iid = pos_intent.pop(token, None) or ledger.record_intent(
+            "sell", token, exit_price, reason=reason, mode="paper")
+        net = r - strategy.RISK["EXIT_FEE"]
+        await loop.run_in_executor(
+            None, lambda: ledger.record_fill(iid, token, exit_price,
+                                             usd=rm.clip * (1 + net), mode="paper",
+                                             extra={"reason": reason, "realized_net": net}))
+        tripped = rm.on_close(net)
+        if tripped:
+            await loop.run_in_executor(None, delivery.send_alert,
+                                       f"ТОРГОВЛЯ ОСТАНОВЛЕНА — {tripped['reason']}")
+            print(f"[RISK] СТОП: {tripped['reason']}")
         pm.close(token)
 
     async def on_event(wallet: str, sig: str) -> None:
@@ -161,15 +176,26 @@ async def run(max_mc: float, seconds: int | None) -> None:
             stats["alerts"] += 1
         # капитал-лимит: бот держит ≤MAX_POSITIONS слотов (replay: 3-5 = edge без потерь,
         # медиана удержания 5.9 мин → низкая конкуренция). Реализм: не открываем сверх лимита.
-        at_cap = len(pm.open_tokens()) >= MAX_POSITIONS
-        if saf.get("verdict") != "danger" and not at_cap:
-            if pm.open(token, info.get("price_usd"), info.get("mc"), signal.actors, ev.ts):
+        allowed, deny, blocked = rm.gate(len(pm.open_tokens()))
+        at_cap = not allowed
+        if blocked and allowed:
+            print(f"[RISK shadow] в live было бы заблокировано: {deny}")
+        if saf.get("verdict") != "danger" and allowed:
+            entry_price = info.get("price_usd")
+            if pm.open(token, entry_price, info.get("mc"), signal.actors, ev.ts):
                 stats["opens"] += 1
+                iid = await loop.run_in_executor(
+                    None, lambda: ledger.record_intent("buy", token, entry_price,
+                                                       reason="signal", mode="paper"))
+                pos_intent[token] = iid
+                await loop.run_in_executor(
+                    None, lambda: ledger.record_fill(iid, token, entry_price,
+                                                     usd=rm.clip, mode="paper"))
                 await shadow(token, "entry")      # фрикция на входе (Фаза B)
         print(f"[SIGNAL {signal.level}{'/quiet' if signal.quiet else ''}] {token} "
               f"n_actors={signal.n_actors} usd=${signal.window_usd} MC=${(mc or 0):,.0f} "
               f"safety={saf.get('verdict')} tg={alert} open={len(pm.open_tokens())}"
-              f"{' [CAP]' if at_cap else ''}")
+              f"{(' [БЛОК: ' + deny + ']') if at_cap else ''}")
 
     async def heartbeat() -> None:
         def _rpc_alive() -> str:
@@ -190,7 +216,8 @@ async def run(max_mc: float, seconds: int | None) -> None:
                    f"(strong={stats['strong']} тихих={stats['quiet']} алертов={stats['alerts']}) · "
                    f"входов={stats['opens']} выходов={stats['exits']} · открытых={len(pm.open_tokens())} · "
                    f"трек={len(tracker.active)} · аном={tracker.anomalies} · "
-                   f"SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}")
+                   f"SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}\n"
+                   f"РИСК: {rm.status()}\n{ledger.summary()}")
             await loop.run_in_executor(None, delivery.send_heartbeat, msg)
 
             # --- контроль качества данных и потока (аудит-4) ---
@@ -202,6 +229,11 @@ async def run(max_mc: float, seconds: int | None) -> None:
             silence_h = (time.time() - stats["last_signal_ts"]) / 3600
             if silence_h > strategy.ALERTS["STALE_SIGNAL_H"]:
                 problems.append(f"нет сигналов {silence_h:.1f}ч — поток иссяк / WS молчит?")
+            if rm.state.halted:
+                problems.append(f"ТОРГОВЛЯ ОСТАНОВЛЕНА: {rm.state.halt_reason}")
+            lg = ledger.reconcile()
+            if not lg["ok"]:
+                problems.append(f"леджер: {lg['orphan_fills']} исполнений без намерений!")
             if tracker.rpc_fails > 0:
                 problems.append(f"RPC-сбоев трекера: {tracker.rpc_fails}")
                 tracker.rpc_fails = 0

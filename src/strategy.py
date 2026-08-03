@@ -22,7 +22,8 @@ _REQUIRED = {
                "SIGNAL_MAX_MC_USD", "SIGNAL_MAX_AGE_S", "SIGNAL_MIN_USD", "QUIET_MAX_USD"],
     "exit": ["PARTIAL_TAKES", "TP_MULT", "SL_MULT", "TRAIL", "TRAIL_ARM",
              "DEAD_AGE_H", "MAX_HOLD_S", "EXIT_ACTOR_FRAC"],
-    "risk": ["MAX_POSITIONS", "EXIT_FEE"],
+    "risk": ["MAX_POSITIONS", "EXIT_FEE", "BANKROLL_USD", "CLIP_USD",
+             "DAILY_STOP_FRAC", "MAX_LOSS_STREAK", "KILL_FILE", "RISK_MODE"],
     "alerts": ["QUALITY_MIN_MC", "QUALITY_MIN_VELOCITY", "SANITY_JUMP",
                "STALE_SIGNAL_H", "MAX_ANOMALY_RATE"],
     "tracking": ["TICK_S", "TRACK_S"],
@@ -59,8 +60,20 @@ def _validate(cfg: dict[str, Any]) -> None:
     s = cfg["signal"]
     if s["CONFLUENCE_N"] > s["STRONG_CONFLUENCE_N"]:
         raise ValueError("strategy.yaml: CONFLUENCE_N > STRONG_CONFLUENCE_N")
-    if cfg["risk"]["MAX_POSITIONS"] < 1:
+    r = cfg["risk"]
+    if r["MAX_POSITIONS"] < 1:
         raise ValueError("strategy.yaml: MAX_POSITIONS >= 1")
+    if r["CLIP_USD"] <= 0 or r["BANKROLL_USD"] <= 0:
+        raise ValueError("strategy.yaml: CLIP_USD и BANKROLL_USD должны быть > 0")
+    if not (0 < r["DAILY_STOP_FRAC"] <= 1):
+        raise ValueError("strategy.yaml: DAILY_STOP_FRAC∈(0,1]")
+    clips = r["BANKROLL_USD"] / r["CLIP_USD"]
+    if clips < 15:
+        # risk-of-ruin (MC на реальном распределении): <15 клипов → разорение до прихода хвоста
+        raise ValueError(f"strategy.yaml: банк = {clips:.0f} клипов, нужно >=15 "
+                         f"(risk-of-ruin: при 5 клипах разорение 20%)")
+    if r["MAX_POSITIONS"] * r["CLIP_USD"] > r["BANKROLL_USD"]:
+        raise ValueError("strategy.yaml: MAX_POSITIONS × CLIP_USD > BANKROLL_USD")
     if cfg["tracking"]["TICK_S"] > 20:
         # на 90с edge исчезал (аудит-3): гранулярность выхода — часть стратегии, не деталь
         raise ValueError("strategy.yaml: TICK_S > 20с — на такой гранулярности edge не выживает")
