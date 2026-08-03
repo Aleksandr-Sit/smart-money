@@ -39,6 +39,27 @@ async def run(max_mc: float, seconds: int | None) -> None:
              "started": time.time(), "last_signal_ts": time.time()}
     loop = asyncio.get_event_loop()
 
+    def sane_price(token: str, price: float | None) -> float | None:
+        """Санитарная проверка цены ИЗ СДЕЛКИ (аудит-5).
+
+        Пылевая продажа (крошечный base_amount в знаменателе) даёт абсурдную цену:
+        в проде поймано 2 случая по $76k–152k за токен → одна запись раздула mean PnL
+        до +908 000 000%. Фильтр из Фазы A закрывал только траектории, этот путь — нет.
+        Сверяем с последней известной хорошей ценой (трекер или вход позиции).
+        """
+        if not price or price <= 0:
+            return None
+        pos = pm.get(token)
+        ref = tracker.last.get(token) or (pos.entry_price if pos else None)
+        if ref and ref > 0:
+            ratio = price / ref
+            if ratio > tracker.SANITY_JUMP or ratio < 1 / tracker.SANITY_JUMP:
+                tracker.anomalies += 1
+                print(f"[trade] SKIP аномальная цена {token[:8]}: {price:.3e} "
+                      f"(ref {ref:.3e}, {ratio:.1e}x) → берём ref")
+                return ref            # опорная цена вместо мусорной
+        return price
+
     async def shadow(token: str, phase: str) -> None:
         """SHADOW-замер фрикции (только котировки, ничего не отправляется). Фаза B."""
         if not strategy.EXECUTION["SHADOW_ENABLED"]:
@@ -86,6 +107,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
                 price = net_sol / trade["base_amount"] * sol
         else:
             price = None
+        price = sane_price(token, price)     # защита от пылевых сделок (см. ниже)
 
         # --- ПРОДАЖА: actor-exit ---
         if trade["side"] == "sell":
