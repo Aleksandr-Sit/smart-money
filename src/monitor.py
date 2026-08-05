@@ -48,7 +48,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
     seen_order: deque[str] = deque()      # FIFO-эвикция: не сбрасываем дедуп разом
     pos_intent: dict[str, str] = {}       # token -> id намерения в леджере
     stats = {"signals": 0, "strong": 0, "quiet": 0, "alerts": 0, "opens": 0, "exits": 0,
-             "started": time.time(), "last_signal_ts": time.time()}
+             "skipped_unsellable": 0, "started": time.time(), "last_signal_ts": time.time()}
     loop = asyncio.get_event_loop()
 
     def sane_price(token: str, price: float | None) -> float | None:
@@ -85,10 +85,10 @@ async def run(max_mc: float, seconds: int | None) -> None:
         except Exception:  # noqa: BLE001
             return None
 
-    async def shadow(token: str, phase: str) -> None:
-        """SHADOW-замер фрикции (только котировки, ничего не отправляется). Фаза B."""
+    async def shadow(token: str, phase: str) -> dict:
+        """SHADOW-замер фрикции (только котировки). Фаза B + гейт продаваемости (аудит-6)."""
         if not strategy.EXECUTION["SHADOW_ENABLED"]:
-            return
+            return {}
         try:
             r = await loop.run_in_executor(None, execution.measure_and_log, token, phase, None)
             if r.get("routable"):
@@ -96,8 +96,10 @@ async def run(max_mc: float, seconds: int | None) -> None:
                       f"итого {r['total_cost']:.2%}")
             else:
                 print(f"[SHADOW {phase}] {token[:12]} НЕ РОУТИТСЯ: {r.get('error')}")
+            return r
         except Exception as e:  # noqa: BLE001
             print(f"[shadow] fail {token[:8]}: {type(e).__name__}")
+            return {}
 
     async def emit_exit(token: str, exit_price: float | None, reason: str) -> None:
         p = pm.get(token)
@@ -222,6 +224,15 @@ async def run(max_mc: float, seconds: int | None) -> None:
         if blocked and allowed:
             print(f"[RISK shadow] в live было бы заблокировано: {deny}")
         if saf.get("verdict") != "danger" and allowed:
+            # ГЕЙТ ПРОДАВАЕМОСТИ (аудит-6): котируем покупку И продажу ДО входа.
+            # Замерено: 10 токенов ни разу не роутились на продажу = в live $100 застрявших
+            # (40% банка $250). Цена проверки — 0.17с латентности; бумажный PnL этих токенов
+            # был −$3, т.е. теряем почти ничего. Замер фрикции тут же и записывается.
+            probe = await shadow(token, "entry")
+            if probe and not probe.get("routable"):
+                stats["skipped_unsellable"] += 1
+                print(f"[GATE] пропуск {token[:12]}: {probe.get('error')}")
+                return
             entry_price = info.get("price_usd")
             if pm.open(token, entry_price, info.get("mc"), signal.actors, ev.ts):
                 stats["opens"] += 1
@@ -233,7 +244,6 @@ async def run(max_mc: float, seconds: int | None) -> None:
                                        extra={"position_id": bid})
                     return bid
                 pos_intent[token] = await loop.run_in_executor(None, _log_buy)
-                await shadow(token, "entry")      # фрикция на входе (Фаза B)
         print(f"[SIGNAL {signal.level}{'/quiet' if signal.quiet else ''}] {token} "
               f"n_actors={signal.n_actors} usd=${signal.window_usd} MC=${(mc or 0):,.0f} "
               f"safety={saf.get('verdict')} tg={alert} open={len(pm.open_tokens())}"
@@ -258,6 +268,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
                    f"(strong={stats['strong']} тихих={stats['quiet']} алертов={stats['alerts']}) · "
                    f"входов={stats['opens']} выходов={stats['exits']} · открытых={len(pm.open_tokens())} · "
                    f"трек={len(tracker.active)} · аном={tracker.anomalies} · "
+                   f"непродаваемых пропущено={stats['skipped_unsellable']} · "
                    f"SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}\n"
                    f"РИСК: {rm.status()}\n{ledger.summary()}")
             await loop.run_in_executor(None, delivery.send_heartbeat, msg)
