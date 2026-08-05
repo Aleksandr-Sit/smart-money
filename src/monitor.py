@@ -21,6 +21,7 @@ from .signal_engine import BuyEvent, SignalEngine, load_actor_map
 HEARTBEAT_S = 6 * 3600
 MAX_POSITIONS = strategy.RISK["MAX_POSITIONS"]   # единый конфиг (капитал-replay: 5 без потерь)
 SEEN_MAX = 100_000
+MAX_EVENT_AGE_S = 300      # событие старше 5 мин = протухшее (backfill), не торгуем
 
 
 def _split(items: list, n: int) -> list[list]:
@@ -34,6 +35,15 @@ async def run(max_mc: float, seconds: int | None) -> None:
     pm = positions.PositionManager()
     tracker = price_track.PriceTracker()
     rm = risk.RiskManager()          # Фаза C: дневной стоп / kill-switch / экспозиция
+    # после рестарта вернуть открытые позиции под трекинг цен, иначе они «ослепнут»
+    # и выйдут по таймауту с ценой 0 = фантомные −100% (аудит-6)
+    for _tok in pm.open_tokens():
+        try:
+            tracker.register(_tok, None, renew=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[track] re-register fail {_tok[:8]}: {type(e).__name__}")
+    if pm.open_tokens():
+        print(f"[monitor] под трекинг возвращено позиций: {len(pm.open_tokens())}")
     seen_sigs: set[str] = set()
     seen_order: deque[str] = deque()      # FIFO-эвикция: не сбрасываем дедуп разом
     pos_intent: dict[str, str] = {}       # token -> id намерения в леджере
@@ -62,6 +72,19 @@ async def run(max_mc: float, seconds: int | None) -> None:
                 return ref            # опорная цена вместо мусорной
         return price
 
+    def _fallback_price(token: str) -> float | None:
+        """Резервный источник цены: котировка Jupiter на клип. None = маршрута нет."""
+        try:
+            q = execution.quote(execution.WSOL, token,
+                                int(rm.clip / market.sol_price() * 1e9),
+                                strategy.EXECUTION["SLIPPAGE_BPS"])
+            if not q or not q.get("outAmount"):
+                return None
+            tokens = int(q["outAmount"])
+            return (rm.clip / tokens) if tokens > 0 else None
+        except Exception:  # noqa: BLE001
+            return None
+
     async def shadow(token: str, phase: str) -> None:
         """SHADOW-замер фрикции (только котировки, ничего не отправляется). Фаза B."""
         if not strategy.EXECUTION["SHADOW_ENABLED"]:
@@ -76,15 +99,22 @@ async def run(max_mc: float, seconds: int | None) -> None:
         except Exception as e:  # noqa: BLE001
             print(f"[shadow] fail {token[:8]}: {type(e).__name__}")
 
-    async def emit_exit(token: str, exit_price: float, reason: str) -> None:
+    async def emit_exit(token: str, exit_price: float | None, reason: str) -> None:
         p = pm.get(token)
         if not p:
             return
+        stale = False
+        if exit_price is None or exit_price <= 0:
+            # цены нет — оцениваем остаток по ПОСЛЕДНЕЙ известной, а не списываем в ноль.
+            # Ноль = утверждение «токен мёртв», которого мы не проверяли (аудит-6).
+            exit_price = tracker.last.get(token) or p.entry_price
+            stale = True
         # замер фрикции В МОМЕНТ ВЫХОДА — ловит тонкую книгу при дампе (стресс-кейс)
         await shadow(token, f"exit_{reason}")
         await loop.run_in_executor(None, delivery.deliver_exit, p, exit_price, reason, True)
         r = positions.total_realized(p, exit_price)   # с учётом частичных тейков
-        print(f"[EXIT {reason}] {token} realized={r:+.0%} (частичн {p.realized:+.0%}+ост {p.remaining:.2f})")
+        print(f"[EXIT {reason}] {token} realized={r:+.0%} "
+              f"(частичн {p.realized:+.0%}+ост {p.remaining:.2f}){' [ЦЕНА УСТАРЕЛА]' if stale else ''}")
         stats["exits"] += 1
         # леджер: у КАЖДОЙ ноги своё намерение (иначе slippage считался бы как PnL сделки —
         # баг найден при сведении статистики 05.08). position_id связывает вход и выход.
@@ -95,7 +125,8 @@ async def run(max_mc: float, seconds: int | None) -> None:
             sid = ledger.record_intent("sell", token, exit_price, reason=reason, mode="paper",
                                        extra={"position_id": pid})
             ledger.record_fill(sid, token, exit_price, usd=rm.clip * (1 + net), mode="paper",
-                               extra={"reason": reason, "realized_net": net, "position_id": pid})
+                               extra={"reason": reason, "realized_net": net, "position_id": pid,
+                                      "price_stale": stale})
         await loop.run_in_executor(None, _log_sell)
         tripped = rm.on_close(net)
         if tripped:
@@ -113,6 +144,13 @@ async def run(max_mc: float, seconds: int | None) -> None:
             seen_sigs.discard(seen_order.popleft())
         trade = await loop.run_in_executor(None, tx_parse.parse_trade, sig, wallet)
         if not trade:
+            return
+        # ПРОТУХШЕЕ СОБЫТИЕ: backfill после WS-реконнекта проигрывает старые сигнатуры.
+        # Замерено (аудит-6): 11 из 9276 сигналов имели задержку >10 мин, максимум 10.6 ЧАСА.
+        # Вход по такой цене в live = гарантированно плохая сделка.
+        age = time.time() - (trade.get("ts") or time.time())
+        if age > MAX_EVENT_AGE_S:
+            print(f"[stale] пропуск события {sig[:10]}: возраст {age/60:.0f} мин")
             return
         sol = await loop.run_in_executor(None, market.sol_price)
         token = trade["token_mint"]
@@ -253,6 +291,11 @@ async def run(max_mc: float, seconds: int | None) -> None:
                 continue
             cur = prices.get(token)
             age_h = (time.time() - p.entry_ts) / 3600
+            if cur is None:
+                # трекер цену не дал — НЕ считаем токен мёртвым вслепую: спрашиваем Jupiter.
+                # Списание в 0 = −100% (аудит-6) искажает статистику, а в live означало бы
+                # «закрыли позицию», пока токены реально лежат в кошельке.
+                cur = await loop.run_in_executor(None, _fallback_price, token)
             res = pm.check_price(token, cur, age_h)
             if not res:
                 continue
@@ -260,7 +303,15 @@ async def run(max_mc: float, seconds: int | None) -> None:
                 await loop.run_in_executor(None, delivery.log_partial, p, cur, res["frac"])
                 print(f"[PARTIAL {res['reason']}] {token} frac={res['frac']:.2f} rem={p.remaining:.2f}")
             else:
-                await emit_exit(token, cur or 0.0, res["reason"])
+                if cur is None:
+                    # цену не дал ни трекер, ни Jupiter → позиция ПОТЕРЯНА, а не обнулена
+                    await emit_exit(token, None, "lost_price")
+                    await loop.run_in_executor(
+                        None, delivery.send_alert,
+                        f"позиция {token[:12]} закрыта БЕЗ цены (ни трекер, ни Jupiter) — "
+                        f"в live проверить кошелёк вручную")
+                else:
+                    await emit_exit(token, cur, res["reason"])
 
     batches = _split(wallets, 5)
     print(f"[monitor] {len(wallets)} кошельков, {len(batches)} WS-соединений, "

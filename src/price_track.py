@@ -111,12 +111,19 @@ class PriceTracker:
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    def register(self, mint: str, price0: float | None, ts: float | None = None) -> None:
-        if mint in self.active:
+    def register(self, mint: str, price0: float | None, ts: float | None = None,
+                 renew: bool = False) -> None:
+        """renew=True — перерегистрация с ТЕКУЩЕГО момента (после рестарта монитора).
+
+        Без этого открытые позиции после перезапуска оставались без цен: трекер их не вёл,
+        exit_tick получал cur=None → таймаут → выход по цене 0 = фантомные −100% (аудит-6:
+        18 таких выходов = −$180 искажения; в live это ЗАБЫТЫЕ токены в кошельке).
+        """
+        if mint in self.active and not renew:
             return
-        t0 = ts or time.time()
+        t0 = time.time() if renew else (ts or time.time())
         self.active[mint] = {"pda": bonding_curve_pda(mint), "t0": t0}
-        if price0:                            # якорь t0 — цена он-чейн покупки из сигнала
+        if price0 and not renew:              # якорь t0 — цена он-чейн покупки из сигнала
             self._append({"ts": t0, "mint": mint, "price_usd": price0, "src": "signal"})
 
     def _poll_once(self) -> list[dict]:

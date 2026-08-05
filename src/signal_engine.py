@@ -66,11 +66,10 @@ class SignalEngine:
         info = self.actor_map.get(ev.wallet)
         if not info or ev.usd < self.cfg["SIGNAL_MIN_USD"]:
             return None
-        # ранний ли токен (если известно)
-        if ev.token_mc is not None and ev.token_mc > self.cfg["SIGNAL_MAX_MC_USD"]:
-            return None
-        if ev.token_age_s is not None and ev.token_age_s > self.cfg["SIGNAL_MAX_AGE_S"]:
-            return None
+        # ПРИМЕЧАНИЕ (аудит-6): гейты по MC/возрасту УДАЛЕНЫ. Они никогда не срабатывали
+        # (BuyEvent создаётся без token_mc), а замер показал, что включать их ВРЕДНО:
+        # сигналы с MC>100k — лучшая когорта (win 0.57 против 0.42 в среднем).
+        # Реальный потолок задаёт monitor --max-mc. Мёртвый код, похожий на защиту, опасен.
 
         actor_id, weight = info
         st = self.tokens.setdefault(ev.token_mint, {"buys": deque(), "last_n": 0})
