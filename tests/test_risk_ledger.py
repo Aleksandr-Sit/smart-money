@@ -12,15 +12,22 @@ def rm(tmp_path, monkeypatch):
     return risk.RiskManager(path=tmp_path / "risk_state.json")
 
 
+def _blow_daily_stop(m, loss=-0.5):
+    """Пробить дневной стоп сделками по `loss`. Считаем от КОНФИГА, не от констант —
+    иначе тесты ломаются при каждой перекалибровке (05.08: стоп 10%→25%, клип $20→$10)."""
+    need = int(m.daily_stop * m.bankroll / (abs(loss) * m.clip)) + 2
+    for _ in range(need):
+        t = m.on_close(loss)
+        if t:
+            return t
+    return None
+
+
 # ---------- дневной стоп ----------
 def test_дневной_стоп_срабатывает_и_блокирует_входы(rm):
     assert rm.gate(0)[0] is True
-    tripped = None
-    for _ in range(10):
-        tripped = rm.on_close(-0.5)          # -50% × клип $20 = -$10 за сделку
-        if tripped:
-            break
-    assert tripped is not None                       # стоп на -$50 (10% от $500)
+    tripped = _blow_daily_stop(rm)
+    assert tripped is not None                       # стоп = DAILY_STOP_FRAC × банк
     assert rm.state.realized_usd <= -0.10 * rm.bankroll
     rm.mode = "enforce"                      # в live денежные лимиты блокируют
     allowed, reason, blocked = rm.gate(0)
@@ -28,16 +35,14 @@ def test_дневной_стоп_срабатывает_и_блокирует_в
 
 
 def test_прибыль_не_вызывает_стоп(rm):
-    for _ in range(20):
+    for _ in range(30):
         assert rm.on_close(+0.5) is None
     assert rm.gate(0)[0] is True
 
 
 def test_стоп_переживает_рестарт(rm, tmp_path, monkeypatch):
     """КРИТИЧНО: перезапуск не должен возобновлять торговлю после лимита потерь."""
-    for _ in range(10):
-        if rm.on_close(-0.5):
-            break
+    _blow_daily_stop(rm)
     monkeypatch.setattr(risk.config, "OUTPUT_DIR", tmp_path)
     fresh = risk.RiskManager(path=tmp_path / "risk_state.json")
     assert fresh.state.halted is True
@@ -56,9 +61,7 @@ def test_битое_состояние_запрещает_торговлю(tmp_p
 
 
 def test_новые_сутки_снимают_дневной_стоп(rm):
-    for _ in range(10):
-        if rm.on_close(-0.5):
-            break
+    _blow_daily_stop(rm)
     assert rm.state.halted is True
     rm.state.day = "2020-01-01"              # имитируем наступление новых UTC-суток
     rm._roll_day()
@@ -92,7 +95,7 @@ def test_лимит_позиций_жёсткий_в_любом_режиме(rm)
 
 
 def test_экспозиция_мягкая_в_shadow_жёсткая_в_enforce(rm):
-    rm.bankroll = 30                          # банк меньше 2 клипов
+    rm.bankroll = rm.clip * 1.5               # банк меньше 2 клипов (от конфига)
     rm.mode = "shadow"
     allowed, reason, blocked = rm.gate(1)
     assert allowed is True and blocked is True and "экспозиция" in reason   # копим данные
