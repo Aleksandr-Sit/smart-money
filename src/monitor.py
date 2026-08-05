@@ -86,14 +86,17 @@ async def run(max_mc: float, seconds: int | None) -> None:
         r = positions.total_realized(p, exit_price)   # с учётом частичных тейков
         print(f"[EXIT {reason}] {token} realized={r:+.0%} (частичн {p.realized:+.0%}+ост {p.remaining:.2f})")
         stats["exits"] += 1
-        # леджер (независимый учёт в деньгах) + риск-менеджер (дневной стоп)
-        iid = pos_intent.pop(token, None) or ledger.record_intent(
-            "sell", token, exit_price, reason=reason, mode="paper")
+        # леджер: у КАЖДОЙ ноги своё намерение (иначе slippage считался бы как PnL сделки —
+        # баг найден при сведении статистики 05.08). position_id связывает вход и выход.
+        pid = pos_intent.pop(token, None)
         net = r - strategy.RISK["EXIT_FEE"]
-        await loop.run_in_executor(
-            None, lambda: ledger.record_fill(iid, token, exit_price,
-                                             usd=rm.clip * (1 + net), mode="paper",
-                                             extra={"reason": reason, "realized_net": net}))
+
+        def _log_sell() -> None:
+            sid = ledger.record_intent("sell", token, exit_price, reason=reason, mode="paper",
+                                       extra={"position_id": pid})
+            ledger.record_fill(sid, token, exit_price, usd=rm.clip * (1 + net), mode="paper",
+                               extra={"reason": reason, "realized_net": net, "position_id": pid})
+        await loop.run_in_executor(None, _log_sell)
         tripped = rm.on_close(net)
         if tripped:
             await loop.run_in_executor(None, delivery.send_alert,
@@ -184,13 +187,14 @@ async def run(max_mc: float, seconds: int | None) -> None:
             entry_price = info.get("price_usd")
             if pm.open(token, entry_price, info.get("mc"), signal.actors, ev.ts):
                 stats["opens"] += 1
-                iid = await loop.run_in_executor(
-                    None, lambda: ledger.record_intent("buy", token, entry_price,
-                                                       reason="signal", mode="paper"))
-                pos_intent[token] = iid
-                await loop.run_in_executor(
-                    None, lambda: ledger.record_fill(iid, token, entry_price,
-                                                     usd=rm.clip, mode="paper"))
+                def _log_buy() -> str:
+                    bid = ledger.record_intent("buy", token, entry_price, reason="signal",
+                                               mode="paper")
+                    # position_id = id намерения на покупку; связывает обе ноги сделки
+                    ledger.record_fill(bid, token, entry_price, usd=rm.clip, mode="paper",
+                                       extra={"position_id": bid})
+                    return bid
+                pos_intent[token] = await loop.run_in_executor(None, _log_buy)
                 await shadow(token, "entry")      # фрикция на входе (Фаза B)
         print(f"[SIGNAL {signal.level}{'/quiet' if signal.quiet else ''}] {token} "
               f"n_actors={signal.n_actors} usd=${signal.window_usd} MC=${(mc or 0):,.0f} "

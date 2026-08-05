@@ -131,3 +131,29 @@ def test_леджер_пишет_версию_стратегии(tmp_path, monke
     ledger.record_intent("buy", "TOK", 1e-5)
     rec = json.loads((tmp_path / ledger.PATH).read_text(encoding="utf-8").splitlines()[0])
     assert rec["strategy_version"] and rec["id"]
+
+
+def test_каждая_нога_сделки_имеет_своё_намерение(tmp_path, monkeypatch):
+    """РЕГРЕСС 05.08: продажа привязывалась к намерению ПОКУПКИ → у 662 из 679 намерений
+    было по 2 исполнения, а 'median_slippage' считал PnL сделки вместо проскальзывания.
+    В live это ослепило бы нас именно к качеству исполнения."""
+    monkeypatch.setattr(ledger.config, "OUTPUT_DIR", tmp_path)
+    bid = ledger.record_intent("buy", "TOK", 1e-5)
+    ledger.record_fill(bid, "TOK", 1e-5, usd=20, extra={"position_id": bid})
+    sid = ledger.record_intent("sell", "TOK", 2e-5, extra={"position_id": bid})   # СВОЁ намерение
+    ledger.record_fill(sid, "TOK", 2e-5, usd=40, extra={"position_id": bid})
+
+    rows = ledger.load()
+    intents = [r for r in rows if r["type"] == "intent"]
+    fills = [r for r in rows if r["type"] == "fill"]
+    assert len(intents) == len(fills) == 2          # 1:1, не 1:2
+    assert sid != bid
+    from collections import Counter
+    assert max(Counter(f["intent_id"] for f in fills).values()) == 1
+
+    r = ledger.reconcile()
+    assert r["unfilled"] == 0 and r["ok"] is True
+    # slippage теперь честный (исполнение по цене намерения), а НЕ +100% PnL сделки
+    assert r["median_slippage"] == pytest.approx(0.0, abs=1e-9)
+    # обе ноги связаны position_id
+    assert {f.get("position_id") for f in fills} == {bid}
