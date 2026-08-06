@@ -25,6 +25,8 @@ def _amt(b: dict) -> float:
 
 
 def parse_trade(signature: str, wallet: str) -> dict | None:
+    if not helius.budget_ok("getTransaction"):
+        return None   # часовой бюджет исчерпан — лучше пропустить сигнал, чем ослепнуть
     try:
         res = helius.rpc("getTransaction", [
             signature,

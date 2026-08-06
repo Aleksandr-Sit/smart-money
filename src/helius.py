@@ -4,18 +4,63 @@
 """
 from __future__ import annotations
 
+import time
 import requests
 
 from .config import secret
 
 RPC_HOST = "mainnet.helius-rpc.com"
+# Публичный узел Solana — запасной провайдер без квоты (инцидент 06.08: лимит Helius
+# исчерпан на 26 дней). Подписок принимает ~50 на соединение при ПЛАВНОЙ отправке.
+PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
+PUBLIC_WS = "wss://api.mainnet-beta.solana.com"
+
+
+# ПРЕДОХРАНИТЕЛЬ (инцидент 06.08): без верхней границы один шторм реконнектов
+# сжёг месячный лимит за 4 дня. Считаем дорогие вызовы и жёстко режем их сверху —
+# лучше потерять часть backfill, чем ослепнуть на 26 дней.
+_HOURLY_CAP = {"getTransaction": 2000, "getSignaturesForAddress": 300}
+_spent: dict[str, list] = {}
+
+
+def budget_ok(method: str) -> bool:
+    """False, если метод исчерпал часовой лимит. Счётчик скользит по часу."""
+    cap = _HOURLY_CAP.get(method)
+    if cap is None:
+        return True
+    now = time.time()
+    hour, used = _spent.get(method, (0.0, 0))
+    if now - hour >= 3600:
+        hour, used = now, 0
+    if used >= cap:
+        return False
+    _spent[method] = (hour, used + 1)
+    return True
+
+
+def budget_report() -> str:
+    now = time.time()
+    parts = []
+    for m, (hour, used) in _spent.items():
+        if now - hour < 3600:
+            parts.append(f"{m.replace('get', '')}={used}/{_HOURLY_CAP[m]}")
+    return " ".join(parts) or "0"
+
+
+def _provider() -> str:
+    from . import strategy
+    return strategy.TRACKING.get("RPC_PROVIDER", "helius")
 
 
 def rpc_url() -> str:
+    if _provider() == "public":
+        return PUBLIC_RPC
     return f"https://{RPC_HOST}/?api-key={secret('HELIUS_API_KEY')}"
 
 
 def ws_url() -> str:
+    if _provider() == "public":
+        return PUBLIC_WS
     return f"wss://{RPC_HOST}/?api-key={secret('HELIUS_API_KEY')}"
 
 

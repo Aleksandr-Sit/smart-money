@@ -16,7 +16,7 @@ import time
 from collections import deque
 
 from . import (config, delivery, execution, helius, helius_ws, ledger, market, positions, price_track,
-               risk, safety, strategy, sweep, tx_parse)
+               log_parse, risk, safety, strategy, sweep, tx_parse)
 from . import wallet as hot_wallet   # псевдоним: в on_event параметр называется wallet
 from .signal_engine import BuyEvent, SignalEngine, load_actor_map
 
@@ -74,7 +74,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
     seen_order: deque[str] = deque()      # FIFO-эвикция: не сбрасываем дедуп разом
     pos_intent: dict[str, str] = {}       # token -> id намерения в леджере
     stats = {"signals": 0, "strong": 0, "quiet": 0, "alerts": 0, "opens": 0, "exits": 0,
-             "skipped_unsellable": 0, "skipped_rule": 0,
+             "skipped_unsellable": 0, "skipped_rule": 0, "from_logs": 0, "from_rpc": 0,
              "started": time.time(), "last_signal_ts": time.time()}
     loop = asyncio.get_event_loop()
 
@@ -164,14 +164,26 @@ async def run(max_mc: float, seconds: int | None) -> None:
             print(f"[RISK] СТОП: {tripped['reason']}")
         pm.close(token)
 
-    async def on_event(wallet: str, sig: str) -> None:
+    async def on_event(wallet: str, sig: str, logs: list | None = None) -> None:
         if sig in seen_sigs:
             return
         seen_sigs.add(sig)
         seen_order.append(sig)
         if len(seen_order) > SEEN_MAX:        # выкидываем только самую старую
             seen_sigs.discard(seen_order.popleft())
-        trade = await loop.run_in_executor(None, tx_parse.parse_trade, sig, wallet)
+        # СНАЧАЛА разбираем логи из самого уведомления — это бесплатно.
+        # getTransaction остаётся лишь запасным путём: он стоил 97% всех кредитов
+        # (242k/сутки, ~646 запросов на один полезный сигнал) и сжёг лимит за 4 дня.
+        trade = log_parse.parse_logs(logs or [], sig)
+        if trade is not None:
+            trade["ts"] = time.time()
+            stats["from_logs"] += 1
+        elif logs and not log_parse.is_trade(logs):
+            return                      # заведомо не сделка — за транзакцией не ходим
+        else:
+            trade = await loop.run_in_executor(None, tx_parse.parse_trade, sig, wallet)
+            if trade:
+                stats["from_rpc"] += 1
         if not trade:
             return
         # ПРОТУХШЕЕ СОБЫТИЕ: backfill после WS-реконнекта проигрывает старые сигнатуры.
@@ -377,6 +389,8 @@ async def run(max_mc: float, seconds: int | None) -> None:
                    f"входов={stats['opens']} выходов={stats['exits']} · открытых={len(pm.open_tokens())} · "
                    f"трек={len(tracker.active)} · аном={tracker.anomalies} · "
                    f"непродаваемых={stats['skipped_unsellable']} правилом={stats['skipped_rule']} · "
+                   f"сделок из логов={stats['from_logs']} через RPC={stats['from_rpc']} "
+                   f"(бюджет {helius.budget_report()}) · "
                    f"SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}\n"
                    f"РИСК: {rm.status()}\n{ledger.summary()}\n"
                    f"КОШЕЛЁК: {hot_wallet.status()}\n{sweep.status()}")
@@ -434,7 +448,20 @@ async def run(max_mc: float, seconds: int | None) -> None:
                 else:
                     await emit_exit(token, cur, res["reason"])
 
-    batches = _split(wallets, strategy.TRACKING["WS_CONNECTIONS"])
+    conns = strategy.TRACKING["WS_CONNECTIONS"]
+    cap = strategy.TRACKING["MAX_SUBS_PER_CONN"]
+    if len(wallets) > conns * cap:
+        # Публичный узел рвёт соединение, если подписок больше ~50: молча потерять
+        # половину кошельков хуже, чем добавить канал.
+        conns = -(-len(wallets) // cap)
+        print(f"[monitor] подписок на канал > {cap} — увеличиваю соединения до {conns}")
+    # Шумные адреса — на свой канал: 99.9% трафика идёт через них, и если публичный
+    # узел оборвёт это соединение, остальные 146 (99.8% первых сигналов) не пострадают.
+    hot = [x for x in wallets if x in set(strategy.TRACKING["HIGH_RATE_WALLETS"])]
+    batches = _split([x for x in wallets if x not in set(hot)], conns)
+    if hot:
+        batches.append(hot)
+        print(f"[monitor] {len(hot)} высокочастотных кошельков вынесены на отдельный канал")
     print(f"[monitor] {len(wallets)} кошельков, {len(batches)} WS-соединений, "
           f"live SOL=${market.sol_price():.2f}, max_MC=${max_mc:,.0f}, "
           f"открытых позиций={len(pm.open_tokens())}. Слушаю (вход+выход)...")

@@ -26,6 +26,9 @@ BACKOFF_JITTER_S = 45        # было 2 — все 5 соединений пе
                              # это «стадо»: пять одновременных попыток вместо равномерных
 RATE_LIMIT_PENALTY_S = 900   # после 429 ждём отдельно и долго: сервер явно просит перестать
 BACKFILL_LIMIT = 50          # максимум сигнатур на кошелёк за один backfill
+SUBSCRIBE_PACE_S = 0.15      # пауза между подписками (публичный узел рвёт связь на залпе)
+SPAM_PROGRAM = "BevFQ2LKT3riywRANkmWWKE5dksoTkpCtn7B1uzp56A3"   # MEV-спам двух наших акторов
+PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
 
 async def _backfill(wallets: list[str], last_sig: dict[str, str],
@@ -37,6 +40,9 @@ async def _backfill(wallets: list[str], last_sig: dict[str, str],
         until = last_sig.get(w)
         if not until:                     # ещё не видели этот кошелёк — нечего догружать
             continue
+        if not helius.budget_ok("getSignaturesForAddress"):
+            print(f"[ws{label}] backfill остановлен: часовой бюджет RPC исчерпан")
+            break
         try:
             res = await loop.run_in_executor(
                 None, helius.rpc, "getSignaturesForAddress",
@@ -74,6 +80,9 @@ async def subscribe_wallets(wallets: list[str], on_event: Callable[[str, str], A
                         "jsonrpc": "2.0", "id": i, "method": "logsSubscribe",
                         "params": [{"mentions": [w]}, {"commitment": "confirmed"}],
                     }))
+                    # ЗАЛПОМ нельзя: публичный узел отвечает "Too many subscriptions
+                    # attempted" и рвёт соединение. С паузой принимает ~50 на канал.
+                    await asyncio.sleep(SUBSCRIBE_PACE_S)
                 print(f"[ws{label}] подписано {len(wallets)} кошельков")
                 if attempt and on_fail:
                     try:
@@ -83,6 +92,10 @@ async def subscribe_wallets(wallets: list[str], on_event: Callable[[str, str], A
                 attempt = 0                            # успешный коннект → сброс backoff
                 await _backfill(wallets, last_sig, on_event, label)   # закрыть окно разрыва
                 async for raw in ws:
+                    # 11.9 млн спам-событий в сутки: отсекаем подстрокой ДО json.loads,
+                    # разбор JSON на них — чистая потеря CPU (замер 06.08).
+                    if SPAM_PROGRAM in raw and PUMP_PROGRAM not in raw:
+                        continue
                     m = json.loads(raw)
                     if "id" in m and "result" in m and not isinstance(m["result"], dict):
                         w = pending.get(m["id"])
@@ -97,7 +110,9 @@ async def subscribe_wallets(wallets: list[str], on_event: Callable[[str, str], A
                         sig = val.get("signature")
                         if w and sig:
                             last_sig[w] = sig          # запомнить последнюю для backfill
-                            await on_event(w, sig)
+                            # ЛОГИ идут вместе с уведомлением — в них есть вся сделка.
+                            # Передаём их дальше, чтобы не платить за getTransaction (инцидент 06.08).
+                            await on_event(w, sig, val.get("logs") or [])
         except Exception as e:  # noqa: BLE001
             attempt += 1
             rate_limited = "429" in str(e)
