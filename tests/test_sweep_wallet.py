@@ -154,7 +154,32 @@ def test_ключ_читается_только_в_wallet():
     """Никакой другой модуль не должен трогать приватный ключ."""
     import pathlib
     root = pathlib.Path(__file__).resolve().parent.parent / "src"
+    # wallet.py — единственный ЧИТАТЕЛЬ ключа; new_wallet.py — единственный ПИСАТЕЛЬ
     for f in root.glob("*.py"):
-        if f.name == "wallet.py":
+        if f.name in ("wallet.py", "new_wallet.py"):
             continue
         assert "SOLANA_PRIVATE_KEY" not in f.read_text(encoding="utf-8"), f"ключ читается в {f.name}"
+
+
+# ---------- генератор кошелька ----------
+def test_генератор_не_перезаписывает_существующий_ключ(tmp_path, monkeypatch):
+    """Перезапись ключа = потеря доступа к средствам на старом кошельке."""
+    from src import new_wallet
+    env = tmp_path / ".env"
+    env.write_text("SOLANA_PRIVATE_KEY=уже_есть_длинный_ключ_значение\n", encoding="utf-8")
+    monkeypatch.setattr(new_wallet, "ENV", env)
+    monkeypatch.setattr("sys.argv", ["new_wallet"])
+    assert new_wallet._existing_key_present() is True
+    before = env.read_text(encoding="utf-8")
+    new_wallet.main()                      # должен отказаться
+    assert env.read_text(encoding="utf-8") == before
+
+
+def test_генератор_не_печатает_приватный_ключ():
+    """Ключ на экране попадает в историю консоли и скриншоты."""
+    import inspect
+    from src import new_wallet
+    src = inspect.getsource(new_wallet)
+    assert "print(f\"    {addr}" in src or "{addr}" in src      # адрес печатаем
+    assert "print(secret_b58" not in src and "print(f\"{secret_b58}" not in src
+    assert "НЕ выводился" in src
