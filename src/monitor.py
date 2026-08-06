@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import time
 from collections import deque
 
-from . import (delivery, execution, helius, helius_ws, ledger, market, positions, price_track,
+from . import (config, delivery, execution, helius, helius_ws, ledger, market, positions, price_track,
                risk, safety, strategy, sweep, tx_parse)
 from . import wallet as hot_wallet   # псевдоним: в on_event параметр называется wallet
 from .signal_engine import BuyEvent, SignalEngine, load_actor_map
@@ -65,6 +66,10 @@ async def run(max_mc: float, seconds: int | None) -> None:
             print(f"[track] re-register fail {_tok[:8]}: {type(e).__name__}")
     if pm.open_tokens():
         print(f"[monitor] под трекинг возвращено позиций: {len(pm.open_tokens())}")
+    try:
+        actor_seen = json.loads((config.OUTPUT_DIR / "actor_activity.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        actor_seen = {}
     seen_sigs: set[str] = set()
     seen_order: deque[str] = deque()      # FIFO-эвикция: не сбрасываем дедуп разом
     pos_intent: dict[str, str] = {}       # token -> id намерения в леджере
@@ -235,7 +240,8 @@ async def run(max_mc: float, seconds: int | None) -> None:
                  and (signal.quiet or quality or bool(PRIORITY & set(signal.actors))))
         await loop.run_in_executor(None, delivery.deliver, signal, saf, info, True, alert)
         stats["signals"] += 1
-        stats["last_signal_ts"] = time.time()      # для алерта «поток иссяк»
+        stats["last_signal_ts"] = time.time()
+        _touch_actors(signal.actors)      # для алерта «поток иссяк»
         if signal.level == "strong":
             stats["strong"] += 1
         if signal.quiet:
@@ -278,6 +284,39 @@ async def run(max_mc: float, seconds: int | None) -> None:
               f"n_actors={signal.n_actors} usd=${signal.window_usd} MC=${(mc or 0):,.0f} "
               f"safety={saf.get('verdict')} tg={alert} open={len(pm.open_tokens())}"
               f"{(' [БЛОК: ' + deny + ']') if at_cap else ''}")
+
+    def _touch_actors(actors) -> None:
+        """Отметить активность акторов (для алерта молчания). Персист переживает рестарт."""
+        now = time.time()
+        for a in actors:
+            actor_seen[a] = now
+        try:
+            (config.OUTPUT_DIR / "actor_activity.json").write_text(
+                json.dumps(actor_seen), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _silence_problems() -> list[str]:
+        """Проверка свежести watchlist: молчащие приоритетные + возраст списка."""
+        probs = []
+        now = time.time()
+        limit = strategy.ALERTS["PRIORITY_SILENCE_H"] * 3600
+        for a in PRIORITY:
+            seen = actor_seen.get(a)
+            if seen is None:
+                probs.append(f"приоритетный актор {a[:10]}… не сигналил НИ РАЗУ за наблюдение")
+            elif now - seen > limit:
+                probs.append(f"приоритетный актор {a[:10]}… молчит "
+                             f"{(now - seen)/3600:.0f}ч — лучшая когорта под угрозой")
+        try:
+            wl = config.OUTPUT_DIR / "flow_watchlist.json"
+            age_d = (now - wl.stat().st_mtime) / 86400
+            if age_d > strategy.ALERTS["WATCHLIST_MAX_AGE_D"]:
+                probs.append(f"watchlist не обновлялся {age_d:.0f} дней — "
+                             f"перезапустить discovery (рынок меняется быстро)")
+        except Exception:  # noqa: BLE001
+            pass
+        return probs
 
     async def sweep_loop() -> None:
         """Периодический вывод прибыли на холодный кошелёк (Фаза D).
@@ -335,6 +374,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
             lg = ledger.reconcile()
             if not lg["ok"]:
                 problems.append(f"леджер: {lg['orphan_fills']} исполнений без намерений!")
+            problems += _silence_problems()
             if tracker.rpc_fails > 0:
                 problems.append(f"RPC-сбоев трекера: {tracker.rpc_fails}")
                 tracker.rpc_fails = 0
