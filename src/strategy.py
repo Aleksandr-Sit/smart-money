@@ -28,6 +28,8 @@ _REQUIRED = {
                "STALE_SIGNAL_H", "MAX_ANOMALY_RATE"],
     "tracking": ["TICK_S", "TRACK_S"],
     "execution": ["SHADOW_CLIP_USD", "SLIPPAGE_BPS", "SHADOW_ENABLED"],
+    "sweep": ["ENABLED", "DRY_RUN", "SWEEP_ADDRESS", "SWEEP_TRIGGER_USD", "SWEEP_MIN_USD",
+              "SWEEP_MAX_USD", "MIN_INTERVAL_S", "FEE_BUFFER_SOL"],
 }
 
 
@@ -74,6 +76,17 @@ def _validate(cfg: dict[str, Any]) -> None:
                          f"(risk-of-ruin: при 5 клипах разорение 20%)")
     if r["MAX_POSITIONS"] * r["CLIP_USD"] > r["BANKROLL_USD"]:
         raise ValueError("strategy.yaml: MAX_POSITIONS × CLIP_USD > BANKROLL_USD")
+    sw = cfg["sweep"]
+    if sw["ENABLED"] and not str(sw["SWEEP_ADDRESS"]).strip():
+        raise ValueError("strategy.yaml: sweep.ENABLED=true, но SWEEP_ADDRESS пуст")
+    if sw["SWEEP_TRIGGER_USD"] <= r["BANKROLL_USD"]:
+        raise ValueError("strategy.yaml: SWEEP_TRIGGER_USD должен быть выше BANKROLL_USD")
+    if sw["SWEEP_TRIGGER_USD"] > r["BANKROLL_USD"] + sw["SWEEP_MIN_USD"] * 2:
+        # иначе шаг вывода не применяется: каждый вывод будет размером с разрыв порога
+        raise ValueError(f"strategy.yaml: порог ${sw['SWEEP_TRIGGER_USD']} слишком высоко над "
+                         f"банком ${r['BANKROLL_USD']} — шаг ${sw['SWEEP_MIN_USD']} не сработает")
+    if sw["SWEEP_MIN_USD"] <= 0 or sw["SWEEP_MAX_USD"] < sw["SWEEP_MIN_USD"]:
+        raise ValueError("strategy.yaml: 0 < SWEEP_MIN_USD <= SWEEP_MAX_USD")
     if cfg["tracking"]["TICK_S"] > 20:
         # на 90с edge исчезал (аудит-3): гранулярность выхода — часть стратегии, не деталь
         raise ValueError("strategy.yaml: TICK_S > 20с — на такой гранулярности edge не выживает")
@@ -96,10 +109,12 @@ RISK = CFG["risk"]
 ALERTS = CFG["alerts"]
 TRACKING = CFG["tracking"]
 EXECUTION = CFG["execution"]
+SWEEP = CFG["sweep"]
 
 
 if __name__ == "__main__":
     print(f"strategy.yaml OK — version {VERSION}")
     for name, sec in (("signal", SIGNAL), ("exit", EXIT), ("risk", RISK),
-                      ("alerts", ALERTS), ("tracking", TRACKING), ("execution", EXECUTION)):
+                      ("alerts", ALERTS), ("tracking", TRACKING), ("execution", EXECUTION),
+                      ("sweep", SWEEP)):
         print(f"  {name}: {sec}")

@@ -15,13 +15,15 @@ import time
 from collections import deque
 
 from . import (delivery, execution, helius, helius_ws, ledger, market, positions, price_track,
-               risk, safety, strategy, tx_parse)
+               risk, safety, strategy, sweep, tx_parse)
+from . import wallet as hot_wallet   # псевдоним: в on_event параметр называется wallet
 from .signal_engine import BuyEvent, SignalEngine, load_actor_map
 
 HEARTBEAT_S = 6 * 3600
 MAX_POSITIONS = strategy.RISK["MAX_POSITIONS"]   # единый конфиг (капитал-replay: 5 без потерь)
 SEEN_MAX = 100_000
 MAX_EVENT_AGE_S = 300      # событие старше 5 мин = протухшее (backfill), не торгуем
+SWEEP_POLL_S = 600         # как часто проверять, не пора ли выводить прибыль
 
 
 def _split(items: list, n: int) -> list[list]:
@@ -249,6 +251,23 @@ async def run(max_mc: float, seconds: int | None) -> None:
               f"safety={saf.get('verdict')} tg={alert} open={len(pm.open_tokens())}"
               f"{(' [БЛОК: ' + deny + ']') if at_cap else ''}")
 
+    async def sweep_loop() -> None:
+        """Периодический вывод прибыли на холодный кошелёк (Фаза D).
+        Выключен по умолчанию; kill-switch НЕ блокирует — убрать деньги со стола безопасно."""
+        while True:
+            await asyncio.sleep(SWEEP_POLL_S)
+            if not strategy.SWEEP["ENABLED"]:
+                continue
+            try:
+                r = await loop.run_in_executor(None, sweep.execute)
+                if r.get("action") in ("sent", "dry_run"):
+                    print(f"[SWEEP {r['action']}] ${r.get('amount_usd', 0):.2f} → "
+                          f"{str(r.get('destination'))[:8]}…")
+            except Exception as e:  # noqa: BLE001
+                print(f"[sweep] fail: {type(e).__name__}: {e}")
+                await loop.run_in_executor(None, delivery.send_alert,
+                                           f"ВЫВОД НЕ УДАЛСЯ: {type(e).__name__}: {str(e)[:100]}")
+
     async def heartbeat() -> None:
         def _rpc_alive() -> str:
             try:                              # живость Helius RPC (баланс кредитов через RPC недоступен)
@@ -270,7 +289,8 @@ async def run(max_mc: float, seconds: int | None) -> None:
                    f"трек={len(tracker.active)} · аном={tracker.anomalies} · "
                    f"непродаваемых пропущено={stats['skipped_unsellable']} · "
                    f"SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}\n"
-                   f"РИСК: {rm.status()}\n{ledger.summary()}")
+                   f"РИСК: {rm.status()}\n{ledger.summary()}\n"
+                   f"КОШЕЛЁК: {hot_wallet.status()}\n{sweep.status()}")
             await loop.run_in_executor(None, delivery.send_heartbeat, msg)
 
             # --- контроль качества данных и потока (аудит-4) ---
@@ -332,6 +352,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
              for i, b in enumerate(batches)]
     tasks.append(asyncio.create_task(tracker.run(on_tick=exit_tick)))   # выходы на 15с-цикле трекера
     tasks.append(asyncio.create_task(heartbeat()))
+    tasks.append(asyncio.create_task(sweep_loop()))
     if seconds:
         await asyncio.sleep(seconds)
         for t in tasks:
