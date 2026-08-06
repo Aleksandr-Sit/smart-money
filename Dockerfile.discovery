@@ -1,0 +1,10 @@
+# Контейнер для еженедельного обновления watchlist (Контур 1 на Dune).
+# Запускается кроном раз в неделю и завершается — не висит 24/7.
+FROM python:3.12-slim
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements-monitor.txt requirements-discovery.txt ./
+RUN pip install --no-cache-dir -r requirements-discovery.txt
+COPY src/ ./src/
+COPY config/ ./config/
+CMD ["python", "-m", "src.auto_refresh", "--days", "30"]

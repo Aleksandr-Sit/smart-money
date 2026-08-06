@@ -7,3 +7,15 @@ services:
       - ./.env:/app/.env:ro          # секреты (HELIUS_API_KEY, опц. TELEGRAM_*)
       - ./output:/app/output          # флоу-watchlist (вход) + signals.log/paper (выход)
     # логи процесса — через docker logs
+
+  # Еженедельное обновление watchlist. НЕ висит постоянно: запускается кроном как
+  # `docker compose run --rm discovery`, отрабатывает и завершается.
+  discovery:
+    build:
+      context: .
+      dockerfile: Dockerfile.discovery
+    profiles: ["manual"]          # не поднимается вместе с монитором
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./output:/app/output
+      - ./data:/app/data          # кэш DuckDB (universe/early_pnl/clusters)
