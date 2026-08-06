@@ -29,7 +29,9 @@ _REQUIRED = {
                "STALE_SIGNAL_H", "MAX_ANOMALY_RATE", "PRIORITY_SILENCE_H",
                "WATCHLIST_MAX_AGE_D"],
     "tracking": ["TICK_S", "TRACK_S"],
-    "execution": ["SHADOW_CLIP_USD", "SLIPPAGE_BPS", "SHADOW_ENABLED"],
+    "execution": ["SHADOW_CLIP_USD", "SLIPPAGE_BPS", "SHADOW_ENABLED", "LIVE_ENABLED",
+                  "MAX_SWAP_USD", "MAX_PRIORITY_LAMPORTS", "PRIORITY_LEVEL",
+                  "CONFIRM_TIMEOUT_S"],
     "sweep": ["ENABLED", "DRY_RUN", "SWEEP_ADDRESS", "SWEEP_TRIGGER_USD", "SWEEP_MIN_USD",
               "SWEEP_MAX_USD", "MIN_INTERVAL_S", "FEE_BUFFER_SOL"],
 }
@@ -83,6 +85,17 @@ def _validate(cfg: dict[str, Any]) -> None:
                          f"(risk-of-ruin: при 5 клипах разорение 20%)")
     if r["MAX_POSITIONS"] * r["CLIP_USD"] > r["BANKROLL_USD"]:
         raise ValueError("strategy.yaml: MAX_POSITIONS × CLIP_USD > BANKROLL_USD")
+    ex = cfg["execution"]
+    if ex["MAX_SWAP_USD"] < r["CLIP_USD"]:
+        raise ValueError("strategy.yaml: MAX_SWAP_USD меньше CLIP_USD — торговать нечем")
+    if ex["MAX_SWAP_USD"] > r["BANKROLL_USD"] / 2:
+        # один своп не должен уносить половину банка даже при ошибке вызова
+        raise ValueError(f"strategy.yaml: MAX_SWAP_USD ${ex['MAX_SWAP_USD']} > половины банка")
+    if ex["PRIORITY_LEVEL"] not in ("medium", "high", "veryHigh"):
+        raise ValueError("strategy.yaml: PRIORITY_LEVEL = medium|high|veryHigh")
+    if ex["LIVE_ENABLED"] and cfg["risk"]["RISK_MODE"] != "enforce":
+        # реальные деньги без жёстких лимитов = дневной стоп не остановит слив
+        raise ValueError("strategy.yaml: LIVE_ENABLED=true требует RISK_MODE=enforce")
     sw = cfg["sweep"]
     if sw["ENABLED"] and not str(sw["SWEEP_ADDRESS"]).strip():
         raise ValueError("strategy.yaml: sweep.ENABLED=true, но SWEEP_ADDRESS пуст")
