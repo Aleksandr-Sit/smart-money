@@ -19,7 +19,12 @@ import websockets
 from . import helius
 
 BACKOFF_BASE_S = 3
-BACKOFF_MAX_S = 60
+BACKOFF_MAX_S = 600          # было 60 — инцидент 06.08: 5 соединений × попытка/мин = 242 попытки/час,
+                             # Helius ответил HTTP 429 и заблокировал ДАЖЕ одиночное подключение.
+                             # Агрессивный ретрай сам поддерживал блокировку.
+BACKOFF_JITTER_S = 45        # было 2 — все 5 соединений переподключались СИНХРОННО (60.3/61.7/60.3с),
+                             # это «стадо»: пять одновременных попыток вместо равномерных
+RATE_LIMIT_PENALTY_S = 900   # после 429 ждём отдельно и долго: сервер явно просит перестать
 BACKFILL_LIMIT = 50          # максимум сигнатур на кошелёк за один backfill
 
 
@@ -52,7 +57,9 @@ async def _backfill(wallets: list[str], last_sig: dict[str, str],
 
 
 async def subscribe_wallets(wallets: list[str], on_event: Callable[[str, str], Awaitable[None]],
-                            label: str = "") -> None:
+                            label: str = "", on_fail=None) -> None:
+    """on_fail(label, attempt, err) — зовётся при обрыве, чтобы монитор мог алертить.
+    Инцидент 06.08: бот молчал час (Helius 429), а система не предупредила — узнали от владельца."""
     url = helius.ws_url()
     last_sig: dict[str, str] = {}     # wallet -> последняя обработанная сигнатура (переживает реконнект)
     attempt = 0
@@ -68,6 +75,11 @@ async def subscribe_wallets(wallets: list[str], on_event: Callable[[str, str], A
                         "params": [{"mentions": [w]}, {"commitment": "confirmed"}],
                     }))
                 print(f"[ws{label}] подписано {len(wallets)} кошельков")
+                if attempt and on_fail:
+                    try:
+                        await on_fail(label, 0, "восстановлено")
+                    except Exception:  # noqa: BLE001
+                        pass
                 attempt = 0                            # успешный коннект → сброс backoff
                 await _backfill(wallets, last_sig, on_event, label)   # закрыть окно разрыва
                 async for raw in ws:
@@ -88,6 +100,20 @@ async def subscribe_wallets(wallets: list[str], on_event: Callable[[str, str], A
                             await on_event(w, sig)
         except Exception as e:  # noqa: BLE001
             attempt += 1
-            delay = min(BACKOFF_MAX_S, BACKOFF_BASE_S * 2 ** (attempt - 1)) + random.uniform(0, 2)
-            print(f"[ws{label}] reconnect #{attempt} через {delay:.1f}с после {type(e).__name__}: {e}")
+            rate_limited = "429" in str(e)
+            if rate_limited:
+                # сервер прямо просит перестать: ждём долго и НЕ наращиваем попытки дальше,
+                # иначе после снятия блокировки бэкофф останется огромным
+                delay = RATE_LIMIT_PENALTY_S + random.uniform(0, BACKOFF_JITTER_S)
+                attempt = min(attempt, 3)
+            else:
+                delay = (min(BACKOFF_MAX_S, BACKOFF_BASE_S * 2 ** (attempt - 1))
+                         + random.uniform(0, BACKOFF_JITTER_S))
+            print(f"[ws{label}] reconnect #{attempt} через {delay:.0f}с "
+                  f"после {type(e).__name__}{' [RATE LIMIT]' if rate_limited else ''}: {str(e)[:80]}")
+            if on_fail:
+                try:
+                    await on_fail(label, attempt, str(e)[:120])
+                except Exception:  # noqa: BLE001
+                    pass
             await asyncio.sleep(delay)

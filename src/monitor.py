@@ -318,6 +318,28 @@ async def run(max_mc: float, seconds: int | None) -> None:
             pass
         return probs
 
+    ws_state = {"failing": set(), "alerted": False}
+
+    async def on_ws_fail(label: str, attempt: int, err: str) -> None:
+        """Алерт при отказе WS-подписок. Инцидент 06.08: Helius 429 ослепил бота на час,
+        а узнали мы об этом от владельца — пульс раз в 6ч слишком медленный для торговли."""
+        if attempt == 0:
+            ws_state["failing"].discard(label)
+            if not ws_state["failing"] and ws_state["alerted"]:
+                ws_state["alerted"] = False
+                await loop.run_in_executor(None, delivery.send_alert,
+                                           "WS-подписки ВОССТАНОВЛЕНЫ — сигналы снова идут")
+            return
+        ws_state["failing"].add(label)
+        # алертим, когда сыпется БОЛЬШИНСТВО соединений (единичный обрыв — норма, ~20/сутки)
+        if len(ws_state["failing"]) >= 3 and attempt >= 2 and not ws_state["alerted"]:
+            ws_state["alerted"] = True
+            await loop.run_in_executor(
+                None, delivery.send_alert,
+                f"БОТ ОСЛЕП: {len(ws_state['failing'])} из {len(batches)} WS-подписок не "
+                f"подключаются (попытка #{attempt}). Сигналы НЕ поступают.\n{err}\n"
+                f"Если это 429 — Helius ограничил доступ, ждём снятия автоматически.")
+
     async def sweep_loop() -> None:
         """Периодический вывод прибыли на холодный кошелёк (Фаза D).
         Выключен по умолчанию; kill-switch НЕ блокирует — убрать деньги со стола безопасно."""
@@ -412,11 +434,12 @@ async def run(max_mc: float, seconds: int | None) -> None:
                 else:
                     await emit_exit(token, cur, res["reason"])
 
-    batches = _split(wallets, 5)
+    batches = _split(wallets, strategy.TRACKING["WS_CONNECTIONS"])
     print(f"[monitor] {len(wallets)} кошельков, {len(batches)} WS-соединений, "
           f"live SOL=${market.sol_price():.2f}, max_MC=${max_mc:,.0f}, "
           f"открытых позиций={len(pm.open_tokens())}. Слушаю (вход+выход)...")
-    tasks = [asyncio.create_task(helius_ws.subscribe_wallets(b, on_event, label=str(i)))
+    tasks = [asyncio.create_task(helius_ws.subscribe_wallets(b, on_event, label=str(i),
+                                                             on_fail=on_ws_fail))
              for i, b in enumerate(batches)]
     tasks.append(asyncio.create_task(tracker.run(on_tick=exit_tick)))   # выходы на 15с-цикле трекера
     tasks.append(asyncio.create_task(heartbeat()))

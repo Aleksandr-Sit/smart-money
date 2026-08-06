@@ -28,7 +28,7 @@ _REQUIRED = {
     "alerts": ["QUALITY_MIN_MC", "QUALITY_MIN_VELOCITY", "SANITY_JUMP",
                "STALE_SIGNAL_H", "MAX_ANOMALY_RATE", "PRIORITY_SILENCE_H",
                "WATCHLIST_MAX_AGE_D"],
-    "tracking": ["TICK_S", "TRACK_S"],
+    "tracking": ["TICK_S", "TRACK_S", "WS_CONNECTIONS"],
     "execution": ["SHADOW_CLIP_USD", "SLIPPAGE_BPS", "SHADOW_ENABLED", "LIVE_ENABLED",
                   "MAX_SWAP_USD", "MAX_PRIORITY_LAMPORTS", "PRIORITY_LEVEL",
                   "CONFIRM_TIMEOUT_S"],
@@ -107,6 +107,8 @@ def _validate(cfg: dict[str, Any]) -> None:
                          f"банком ${r['BANKROLL_USD']} — шаг ${sw['SWEEP_MIN_USD']} не сработает")
     if sw["SWEEP_MIN_USD"] <= 0 or sw["SWEEP_MAX_USD"] < sw["SWEEP_MIN_USD"]:
         raise ValueError("strategy.yaml: 0 < SWEEP_MIN_USD <= SWEEP_MAX_USD")
+    if not (1 <= cfg["tracking"]["WS_CONNECTIONS"] <= 5):
+        raise ValueError("strategy.yaml: WS_CONNECTIONS вне 1..5 (лимит Helius free)")
     if cfg["tracking"]["TICK_S"] > 20:
         # на 90с edge исчезал (аудит-3): гранулярность выхода — часть стратегии, не деталь
         raise ValueError("strategy.yaml: TICK_S > 20с — на такой гранулярности edge не выживает")
