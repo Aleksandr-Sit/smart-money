@@ -24,6 +24,25 @@ MAX_POSITIONS = strategy.RISK["MAX_POSITIONS"]   # единый конфиг (к
 SEEN_MAX = 100_000
 MAX_EVENT_AGE_S = 300      # событие старше 5 мин = протухшее (backfill), не торгуем
 SWEEP_POLL_S = 600         # как часто проверять, не пора ли выводить прибыль
+PRIORITY = set(strategy.ENTRY["PRIORITY_ACTORS"])
+
+
+def tradable(signal) -> tuple[bool, str]:
+    """Правило входа (аудит-7). Три популяции сигналов, одна из них убыточна.
+
+    strong без приоритетных  → mean +25.0%  торгуем
+    weak С приоритетным      → mean +68.9%  торгуем (медиана +68%)
+    weak без приоритетных    → mean −4.8%   ОТБРАСЫВАЕМ (убыток во всех фолдах)
+    Проверено скользящей валидацией: +$2045 против +$1545 при 42% сделок.
+    """
+    if strategy.ENTRY["RULE"] == "all":
+        return True, "all"
+    has_priority = bool(PRIORITY & set(signal.actors))
+    if signal.level == "strong":
+        return True, "strong+приоритет" if has_priority else "strong"
+    if has_priority:
+        return True, "приоритетный актор"
+    return False, "weak без приоритетных (убыточная когорта)"
 
 
 def _split(items: list, n: int) -> list[list]:
@@ -50,7 +69,8 @@ async def run(max_mc: float, seconds: int | None) -> None:
     seen_order: deque[str] = deque()      # FIFO-эвикция: не сбрасываем дедуп разом
     pos_intent: dict[str, str] = {}       # token -> id намерения в леджере
     stats = {"signals": 0, "strong": 0, "quiet": 0, "alerts": 0, "opens": 0, "exits": 0,
-             "skipped_unsellable": 0, "started": time.time(), "last_signal_ts": time.time()}
+             "skipped_unsellable": 0, "skipped_rule": 0,
+             "started": time.time(), "last_signal_ts": time.time()}
     loop = asyncio.get_event_loop()
 
     def sane_price(token: str, price: float | None) -> float | None:
@@ -208,8 +228,11 @@ async def run(max_mc: float, seconds: int | None) -> None:
         # quality MC≥15k+vel≥40 win 58% mean +43%, обе робастны). Оба шлём в Telegram.
         quality = ((info.get("mc") or 0) >= strategy.ALERTS["QUALITY_MIN_MC"]
                    and (info.get("buys_h1") or 0) >= strategy.ALERTS["QUALITY_MIN_VELOCITY"])
-        alert = (signal.level == "strong" and saf.get("verdict") in ("ok", "warn")
-                 and (signal.quiet or quality))
+        # ВАЖНО: раньше алерт требовал strong → сигналы приоритетного актора (они weak,
+        # т.к. это 2 кошельковые группы одного оператора) НЕ доходили вовсе, а это лучшая
+        # когорта (медиана +68%). Теперь алертим всё торгуемое с приемлемым safety.
+        alert = (saf.get("verdict") in ("ok", "warn")
+                 and (signal.quiet or quality or bool(PRIORITY & set(signal.actors))))
         await loop.run_in_executor(None, delivery.deliver, signal, saf, info, True, alert)
         stats["signals"] += 1
         stats["last_signal_ts"] = time.time()      # для алерта «поток иссяк»
@@ -221,6 +244,11 @@ async def run(max_mc: float, seconds: int | None) -> None:
             stats["alerts"] += 1
         # капитал-лимит: бот держит ≤MAX_POSITIONS слотов (replay: 3-5 = edge без потерь,
         # медиана удержания 5.9 мин → низкая конкуренция). Реализм: не открываем сверх лимита.
+        ok_rule, rule_why = tradable(signal)
+        if not ok_rule:
+            stats["skipped_rule"] += 1
+            print(f"[RULE] пропуск {token[:12]}: {rule_why}")
+            return
         allowed, deny, blocked = rm.gate(len(pm.open_tokens()))
         at_cap = not allowed
         if blocked and allowed:
@@ -287,7 +315,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
                    f"(strong={stats['strong']} тихих={stats['quiet']} алертов={stats['alerts']}) · "
                    f"входов={stats['opens']} выходов={stats['exits']} · открытых={len(pm.open_tokens())} · "
                    f"трек={len(tracker.active)} · аном={tracker.anomalies} · "
-                   f"непродаваемых пропущено={stats['skipped_unsellable']} · "
+                   f"непродаваемых={stats['skipped_unsellable']} правилом={stats['skipped_rule']} · "
                    f"SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}\n"
                    f"РИСК: {rm.status()}\n{ledger.summary()}\n"
                    f"КОШЕЛЁК: {hot_wallet.status()}\n{sweep.status()}")

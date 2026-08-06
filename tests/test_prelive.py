@@ -67,3 +67,37 @@ def test_потолок_mc_остаётся_в_мониторе():
     from src import signal_engine
     src = inspect.getsource(signal_engine.SignalEngine.process)
     assert "SIGNAL_MAX_MC_USD" not in src and "SIGNAL_MAX_AGE_S" not in src
+
+
+# ---------- правило входа (аудит-7) ----------
+class _Sig:
+    def __init__(self, level, actors):
+        self.level = level
+        self.actors = actors
+
+
+def test_правило_входа_три_популяции(monkeypatch):
+    """Замерено на 2007 сделках: weak без приоритетных теряет деньги (mean −4.8%),
+    strong даёт +25.0%, weak с приоритетным +68.9%. Правило торгует первые две."""
+    from src import monitor, strategy
+    prio = list(strategy.ENTRY["PRIORITY_ACTORS"])[0]
+    monkeypatch.setattr(monitor.strategy, "ENTRY",
+                        {**strategy.ENTRY, "RULE": "strong_or_priority"})
+    assert monitor.tradable(_Sig("strong", ["a", "b", "c"]))[0] is True       # 3 актора
+    assert monitor.tradable(_Sig("weak", [prio, "x"]))[0] is True             # приоритетный
+    ok, why = monitor.tradable(_Sig("weak", ["a", "b"]))
+    assert ok is False and "убыточ" in why                                    # отбрасываем
+
+
+def test_режим_all_торгует_всё(monkeypatch):
+    """Режим сбора данных: правило можно отключить, не трогая код."""
+    from src import monitor, strategy
+    monkeypatch.setattr(monitor.strategy, "ENTRY", {**strategy.ENTRY, "RULE": "all"})
+    assert monitor.tradable(_Sig("weak", ["a", "b"]))[0] is True
+
+
+def test_приоритетные_акторы_заданы():
+    """Пустой список при активном правиле = все weak отброшены, полсигналов потеряно."""
+    from src import strategy
+    if strategy.ENTRY["RULE"] == "strong_or_priority":
+        assert strategy.ENTRY["PRIORITY_ACTORS"], "PRIORITY_ACTORS пуст при активном правиле"

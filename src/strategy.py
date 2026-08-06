@@ -20,6 +20,7 @@ PATH = ROOT / "config" / "strategy.yaml"
 _REQUIRED = {
     "signal": ["CONFLUENCE_N", "STRONG_CONFLUENCE_N", "CONFLUENCE_WINDOW_S",
                "SIGNAL_MAX_MC_USD", "SIGNAL_MAX_AGE_S", "SIGNAL_MIN_USD", "QUIET_MAX_USD"],
+    "entry": ["RULE", "PRIORITY_ACTORS"],
     "exit": ["PARTIAL_TAKES", "TP_MULT", "SL_MULT", "TRAIL", "TRAIL_ARM",
              "DEAD_AGE_H", "MAX_HOLD_S", "EXIT_ACTOR_FRAC"],
     "risk": ["MAX_POSITIONS", "EXIT_FEE", "BANKROLL_USD", "CLIP_USD",
@@ -59,6 +60,11 @@ def _validate(cfg: dict[str, Any]) -> None:
         total += frac
     if total > 1.0 + 1e-9:
         raise ValueError(f"strategy.yaml: сумма долей PARTIAL_TAKES = {total} > 1")
+    en = cfg["entry"]
+    if en["RULE"] not in ("all", "strong_or_priority"):
+        raise ValueError(f"strategy.yaml: entry.RULE = {en['RULE']!r}, ожидается all|strong_or_priority")
+    if en["RULE"] == "strong_or_priority" and not en["PRIORITY_ACTORS"]:
+        raise ValueError("strategy.yaml: RULE=strong_or_priority, но PRIORITY_ACTORS пуст")
     s = cfg["signal"]
     if s["CONFLUENCE_N"] > s["STRONG_CONFLUENCE_N"]:
         raise ValueError("strategy.yaml: CONFLUENCE_N > STRONG_CONFLUENCE_N")
@@ -104,6 +110,7 @@ def load(path: Path | None = None) -> dict[str, Any]:
 CFG = load()
 VERSION: str = CFG["version"]
 SIGNAL = CFG["signal"]
+ENTRY = CFG["entry"]
 EXIT = CFG["exit"]
 RISK = CFG["risk"]
 ALERTS = CFG["alerts"]
@@ -114,7 +121,7 @@ SWEEP = CFG["sweep"]
 
 if __name__ == "__main__":
     print(f"strategy.yaml OK — version {VERSION}")
-    for name, sec in (("signal", SIGNAL), ("exit", EXIT), ("risk", RISK),
+    for name, sec in (("signal", SIGNAL), ("entry", ENTRY), ("exit", EXIT), ("risk", RISK),
                       ("alerts", ALERTS), ("tracking", TRACKING), ("execution", EXECUTION),
                       ("sweep", SWEEP)):
         print(f"  {name}: {sec}")
