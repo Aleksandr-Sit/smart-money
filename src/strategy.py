@@ -93,8 +93,8 @@ def _validate(cfg: dict[str, Any]) -> None:
         raise ValueError(f"strategy.yaml: MAX_SWAP_USD ${ex['MAX_SWAP_USD']} > половины банка")
     if ex["PRIORITY_LEVEL"] not in ("medium", "high", "veryHigh"):
         raise ValueError("strategy.yaml: PRIORITY_LEVEL = medium|high|veryHigh")
-    if ex["SEND_PROVIDER"] not in ("helius", "public"):
-        raise ValueError("strategy.yaml: SEND_PROVIDER должен быть helius или public")
+    if ex["SEND_PROVIDER"] not in ("helius", "public", "drpc", "jito"):
+        raise ValueError("strategy.yaml: SEND_PROVIDER должен быть helius, drpc, jito или public")
     if ex["LIVE_ENABLED"] and ex["SEND_PROVIDER"] == "public":
         raise ValueError("strategy.yaml: живая торговля через публичный узел запрещена — "
                          "он лимитирует sendTransaction и может не разослать сделку")

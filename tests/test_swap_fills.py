@@ -75,3 +75,24 @@ def test_живая_торговля_на_надёжном_узле_проход
     cfg["execution"]["LIVE_ENABLED"] = True
     cfg["execution"]["SEND_PROVIDER"] = "helius"
     strategy._validate(cfg)          # не должно бросать
+
+
+def test_каждый_провайдер_отправки_даёт_свой_адрес(monkeypatch):
+    """Отправка не должна молча свалиться на узел чтения ни при какой настройке."""
+    monkeypatch.setitem(strategy.TRACKING, "RPC_PROVIDER", "public")
+    monkeypatch.setenv("DRPC_API_KEY", "тестовый-ключ")
+    seen = {}
+    for who in ("public", "jito", "drpc"):
+        monkeypatch.setitem(strategy.EXECUTION, "SEND_PROVIDER", who)
+        seen[who] = helius.send_url()
+    assert seen["jito"] == helius.JITO_SEND
+    assert "solana" in seen["drpc"] and helius.DRPC_HOST in seen["drpc"]
+    assert len(set(seen.values())) == 3          # адреса различны, подмены нет
+
+
+def test_неизвестный_провайдер_отправки_отвергается():
+    """Опечатка в конфиге не должна тихо отправить деньги куда попало."""
+    cfg = _real_cfg()
+    cfg["execution"]["SEND_PROVIDER"] = "quiknode"
+    with pytest.raises(ValueError, match="SEND_PROVIDER"):
+        strategy._validate(cfg)

@@ -52,6 +52,13 @@ def _provider() -> str:
     return strategy.TRACKING.get("RPC_PROVIDER", "helius")
 
 
+DRPC_HOST = "lb.drpc.live"
+# Jito — блок-энджин, отдельный путь к валидаторам, не тот пул, откуда мы читаем.
+# Замер 07.08 с сервера во Франкфурте: отклик 0.04с против 0.08с у публичного узла.
+# Лимит по частоте жёсткий: пять запросов подряд дали 429, с паузой 1.2с метод открыт.
+JITO_SEND = "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/transactions"
+
+
 def send_url() -> str:
     """Узел для ОТПРАВКИ сделок. Отдельно от чтения: публичный узел не предназначен
     для sendTransaction — он лимитирует и может молча не разослать транзакцию.
@@ -60,6 +67,10 @@ def send_url() -> str:
     who = strategy.EXECUTION.get("SEND_PROVIDER", "helius")
     if who == "public":
         return PUBLIC_RPC
+    if who == "jito":
+        return JITO_SEND
+    if who == "drpc":
+        return f"https://{DRPC_HOST}/solana/{secret('DRPC_API_KEY')}"
     return f"https://{RPC_HOST}/?api-key={secret('HELIUS_API_KEY')}"
 
 
