@@ -47,8 +47,11 @@ def _validate(cfg: dict[str, Any]) -> None:
             if k not in cfg[section]:
                 raise ValueError(f"strategy.yaml: нет параметра {section}.{k}")
     e = cfg["exit"]
-    if not (0 < e["SL_MULT"] < 1 < e["TP_MULT"]):
-        raise ValueError("strategy.yaml: должно быть 0 < SL_MULT < 1 < TP_MULT")
+    # SL_MULT = 0 означает «стоп отключён» (07.08: замер дал +672$ без него).
+    # Отрицательный или >=1 по-прежнему бессмыслица.
+    if not (0 <= e["SL_MULT"] < 1 < e["TP_MULT"]):
+        raise ValueError("strategy.yaml: должно быть 0 <= SL_MULT < 1 < TP_MULT "
+                         "(0 = стоп отключён)")
     if not (0 < e["TRAIL"] < 1) or e["TRAIL_ARM"] < 1:
         raise ValueError("strategy.yaml: TRAIL∈(0,1), TRAIL_ARM>=1")
     if not (0 < e["EXIT_ACTOR_FRAC"] <= 1):

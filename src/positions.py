@@ -105,7 +105,10 @@ class PositionManager:
                     return {"action": "partial", "reason": "take_partial", "frac": sell}
             if mult >= self.cfg["TP_MULT"]:
                 return {"action": "close", "reason": "take_profit"}
-            if mult <= self.cfg["SL_MULT"]:
+            # SL_MULT=0 → стоп отключён. Проверка нужна явно: при цене 0 условие
+            # mult <= 0 сработало бы и закрыло позицию «стопом», хотя стопа нет
+            # (мёртвый токен закрывается отдельным правилом DEAD_AGE_H).
+            if self.cfg["SL_MULT"] > 0 and mult <= self.cfg["SL_MULT"]:
                 return {"action": "close", "reason": "stop_loss"}
             peak_mult = p.peak_price / p.entry_price if p.entry_price else 0
             if peak_mult >= self.cfg["TRAIL_ARM"] and cur_price <= p.peak_price * (1 - self.cfg["TRAIL"]):
@@ -150,7 +153,9 @@ if __name__ == "__main__":   # самотест логики выходов (ч�
     f = config.OUTPUT_DIR / "open_positions.json"
     if f.exists():
         os.remove(f)
-    pm = PositionManager()
+    # ЯВНЫЙ конфиг: в бою тейки и стоп отключены (07.08), но механизмы в коде остались
+    DEMO = {"PARTIAL_TAKES": [(2.0, 0.5)], "SL_MULT": 0.5}
+    pm = PositionManager(DEMO)
     pm.open("TOK", 0.001, 1_000_000, ["a1", "a2"], 1000)    # entry 0.001
     print("partial 50%@2x (цена 0.002):", pm.check_price("TOK", 0.002, 0.1))
     pos = pm.get("TOK")
@@ -161,7 +166,7 @@ if __name__ == "__main__":   # самотест логики выходов (ч�
 
     if f.exists():
         os.remove(f)
-    pm = PositionManager()
+    pm = PositionManager(DEMO)
     pm.open("T2", 0.001, 1e6, ["a1", "a2"], 1000)
     print("\nSL остатка (0.0004) без тейка:", pm.check_price("T2", 0.0004, 0.1))
     print(f"  total_realized при SL 0.0004: {total_realized(pm.get('T2'), 0.0004):+.2f} (ожид -0.6)")

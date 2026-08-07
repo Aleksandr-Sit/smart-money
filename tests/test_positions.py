@@ -17,7 +17,7 @@ def pm(tmp_path, monkeypatch):
     Тест механизма не должен зависеть от текущего значения в strategy.yaml.
     """
     from src import strategy
-    m = PositionManager({**strategy.EXIT, "PARTIAL_TAKES": [(2.0, 0.5)]})
+    m = PositionManager({**strategy.EXIT, "PARTIAL_TAKES": [(2.0, 0.5)], "SL_MULT": 0.5})
     m.path = tmp_path / "open_positions.json"
     m.pos = {}
     return m
@@ -103,3 +103,38 @@ def test_стейт_переживает_перезагрузку(pm, tmp_path):
     reloaded._load()
     r = reloaded.get("TOK")
     assert r is not None and r.remaining == pytest.approx(0.5) and r.realized == pytest.approx(0.5)
+
+
+def test_стоп_отключается_нулём(tmp_path):
+    """SL_MULT=0 — стоп не срабатывает НИКОГДА, включая цену 0.
+
+    07.08: стоп убран по замеру (+672$). Проверка на 0 нужна явно — условие
+    `mult <= 0` при нулевой цене закрыло бы позицию «стопом», которого нет.
+    Мёртвый токен закрывается отдельным правилом DEAD_AGE_H.
+    """
+    from src import strategy
+    pm = PositionManager({**strategy.EXIT, "SL_MULT": 0.0, "PARTIAL_TAKES": []})
+    pm.path = tmp_path / "p.json"
+    pm.pos = {}
+    pm.open("TOK", 0.001, 1e6, ["a1", "a2"], 1000)
+    assert pm.check_price("TOK", 0.0001, 0.1) is None      # −90% и позиция жива
+    assert pm.check_price("TOK", 0.0, 0.1) is None         # цена 0 — не «стоп»
+
+
+def test_стоп_работает_если_его_вернуть(tmp_path):
+    """Механизм остаётся рабочим: положительный SL_MULT снова закрывает позицию."""
+    from src import strategy
+    pm = PositionManager({**strategy.EXIT, "SL_MULT": 0.5, "PARTIAL_TAKES": []})
+    pm.path = tmp_path / "p.json"
+    pm.pos = {}
+    pm.open("TOK", 0.001, 1e6, ["a1", "a2"], 1000)
+    assert pm.check_price("TOK", 0.0004, 0.1)["reason"] == "stop_loss"
+
+
+def test_боевой_конфиг_без_стопа_и_тейка():
+    """Фиксируем принятое решение, чтобы случайный откат конфига был заметен."""
+    from src import strategy
+    assert strategy.EXIT["SL_MULT"] == 0.0
+    assert strategy.EXIT["PARTIAL_TAKES"] == []
+    assert strategy.EXIT["TP_MULT"] == 6.0        # тейк 6x остаётся
+    assert strategy.EXIT["MAX_HOLD_S"] == 1800    # таймаут остаётся
