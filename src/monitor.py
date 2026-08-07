@@ -16,7 +16,7 @@ import time
 from collections import deque
 
 from . import (config, delivery, execution, helius, helius_ws, ledger, market, positions, price_track,
-               log_parse, risk, safety, strategy, sweep, tx_parse)
+               log_parse, risk, safety, strategy, swap, sweep, tx_parse)
 from . import wallet as hot_wallet   # псевдоним: в on_event параметр называется wallet
 from .signal_engine import BuyEvent, SignalEngine, load_actor_map
 
@@ -128,6 +128,57 @@ async def run(max_mc: float, seconds: int | None) -> None:
             print(f"[shadow] fail {token[:8]}: {type(e).__name__}")
             return {}
 
+    # ---- слой исполнения: paper и live идут ОДНИМ путём решений ----------------
+    # Решение о входе/выходе принимается одинаково; различается только то, уходит ли
+    # сделка в сеть. Асимметрия здесь опаснее всего: если live-ветка думает иначе,
+    # чем paper, то весь накопленный бумажный результат перестаёт что-либо значить.
+    LIVE = bool(strategy.EXECUTION["LIVE_ENABLED"])
+
+    async def do_buy(token: str, price: float | None) -> str | None:
+        """Открыть позицию физически. None = не купили (в live позиции быть не должно)."""
+        if not LIVE:
+            def _paper() -> str:
+                bid = ledger.record_intent("buy", token, price, reason="signal", mode="paper")
+                # position_id = id намерения на покупку; связывает обе ноги сделки
+                ledger.record_fill(bid, token, price, usd=rm.clip, mode="paper",
+                                   extra={"position_id": bid})
+                return bid
+            return await loop.run_in_executor(None, _paper)
+        try:
+            r = await loop.run_in_executor(None, swap.buy, token, rm.clip)
+        except Exception as e:  # noqa: BLE001
+            # fail closed: не купили — значит позиции нет, и делать вид, что есть, нельзя
+            print(f"[LIVE BUY FAIL] {token[:12]}: {type(e).__name__}: {str(e)[:120]}")
+            await loop.run_in_executor(None, delivery.send_alert,
+                                       f"ПОКУПКА НЕ ПРОШЛА {token[:12]}: {str(e)[:150]}")
+            return None
+        return r.get("intent")
+
+    async def do_sell(token: str, fraction: float, price: float | None,
+                      reason: str, pid: str | None, net: float | None = None) -> bool:
+        """Продать долю позиции. False = продажа не прошла (в live токен всё ещё у нас)."""
+        if not LIVE:
+            def _paper() -> None:
+                sid = ledger.record_intent("sell", token, price, reason=reason, mode="paper",
+                                           extra={"position_id": pid, "fraction": fraction})
+                ledger.record_fill(sid, token, price,
+                                   usd=rm.clip * fraction * (1 + (net if net is not None else 0.0)),
+                                   mode="paper",
+                                   extra={"reason": reason, "realized_net": net,
+                                          "position_id": pid, "fraction": fraction})
+            await loop.run_in_executor(None, _paper)
+            return True
+        try:
+            await loop.run_in_executor(None, swap.sell, token, fraction, reason)
+        except Exception as e:  # noqa: BLE001
+            # токен остался у нас — это НЕ тихая ошибка, нужен человек
+            print(f"[LIVE SELL FAIL] {token[:12]}: {type(e).__name__}: {str(e)[:120]}")
+            await loop.run_in_executor(None, delivery.send_alert,
+                                       f"ПРОДАЖА НЕ ПРОШЛА {token[:12]} ({reason}): "
+                                       f"{str(e)[:150]} — токен ещё в кошельке, проверить вручную")
+            return False
+        return True
+
     async def emit_exit(token: str, exit_price: float | None, reason: str) -> None:
         p = pm.get(token)
         if not p:
@@ -140,23 +191,22 @@ async def run(max_mc: float, seconds: int | None) -> None:
             stale = True
         # замер фрикции В МОМЕНТ ВЫХОДА — ловит тонкую книгу при дампе (стресс-кейс)
         await shadow(token, f"exit_{reason}")
-        await loop.run_in_executor(None, delivery.deliver_exit, p, exit_price, reason, True)
         r = positions.total_realized(p, exit_price)   # с учётом частичных тейков
-        print(f"[EXIT {reason}] {token} realized={r:+.0%} "
-              f"(частичн {p.realized:+.0%}+ост {p.remaining:.2f}){' [ЦЕНА УСТАРЕЛА]' if stale else ''}")
-        stats["exits"] += 1
         # леджер: у КАЖДОЙ ноги своё намерение (иначе slippage считался бы как PnL сделки —
         # баг найден при сведении статистики 05.08). position_id связывает вход и выход.
         pid = pos_intent.pop(token, None)
         net = r - strategy.RISK["EXIT_FEE"]
-
-        def _log_sell() -> None:
-            sid = ledger.record_intent("sell", token, exit_price, reason=reason, mode="paper",
-                                       extra={"position_id": pid})
-            ledger.record_fill(sid, token, exit_price, usd=rm.clip * (1 + net), mode="paper",
-                               extra={"reason": reason, "realized_net": net, "position_id": pid,
-                                      "price_stale": stale})
-        await loop.run_in_executor(None, _log_sell)
+        # ПРОДАЁМ ПЕРВЫМ ДЕЛОМ: сообщать о выходе, которого не случилось, нельзя.
+        # fraction=1.0 — это ВЕСЬ остаток на кошельке; p.remaining измеряется от
+        # исходной позиции и после частичного тейка означает другое число.
+        sold = await do_sell(token, 1.0, exit_price, reason, pid, net)
+        if not sold:
+            pos_intent[token] = pid       # позиция ещё наша — вернуть связку для повтора
+            return
+        await loop.run_in_executor(None, delivery.deliver_exit, p, exit_price, reason, True)
+        print(f"[EXIT {reason}] {token} realized={r:+.0%} "
+              f"(частичн {p.realized:+.0%}+ост {p.remaining:.2f}){' [ЦЕНА УСТАРЕЛА]' if stale else ''}")
+        stats["exits"] += 1
         tripped = rm.on_close(net)
         if tripped:
             await loop.run_in_executor(None, delivery.send_alert,
@@ -286,15 +336,14 @@ async def run(max_mc: float, seconds: int | None) -> None:
                 return
             entry_price = info.get("price_usd")
             if pm.open(token, entry_price, info.get("mc"), signal.actors, ev.ts):
+                bid = await do_buy(token, entry_price)
+                if bid is None:
+                    # в live покупка не прошла — откатываем слот, иначе бот будет
+                    # вести позицию, которой в кошельке нет, и «продаст» пустоту
+                    pm.close(token)
+                    return
                 stats["opens"] += 1
-                def _log_buy() -> str:
-                    bid = ledger.record_intent("buy", token, entry_price, reason="signal",
-                                               mode="paper")
-                    # position_id = id намерения на покупку; связывает обе ноги сделки
-                    ledger.record_fill(bid, token, entry_price, usd=rm.clip, mode="paper",
-                                       extra={"position_id": bid})
-                    return bid
-                pos_intent[token] = await loop.run_in_executor(None, _log_buy)
+                pos_intent[token] = bid
         print(f"[SIGNAL {signal.level}{'/quiet' if signal.quiet else ''}] {token} "
               f"n_actors={signal.n_actors} usd=${signal.window_usd} MC=${(mc or 0):,.0f} "
               f"safety={saf.get('verdict')} tg={alert} open={len(pm.open_tokens())}"
@@ -441,6 +490,17 @@ async def run(max_mc: float, seconds: int | None) -> None:
             if not res:
                 continue
             if res["action"] == "partial":        # частичный тейк — позиция продолжается
+                # res["frac"] — доля ИСХОДНОЙ позиции, а своп продаёт долю ТЕКУЩЕГО
+                # баланса кошелька. До тейка на руках было (remaining + frac).
+                before = p.remaining + res["frac"]
+                frac_of_wallet = res["frac"] / before if before > 1e-9 else 1.0
+                mult = (cur / p.entry_price) if (cur and p.entry_price) else 1.0
+                ok = await do_sell(token, frac_of_wallet, cur, res["reason"],
+                                   pos_intent.get(token), mult - 1)
+                if not ok:
+                    # токены остались у нас — вернуть учёт, иначе на выходе продадим меньше
+                    pm.rollback_partial(token, res["frac"], mult)
+                    continue
                 await loop.run_in_executor(None, delivery.log_partial, p, cur, res["frac"])
                 print(f"[PARTIAL {res['reason']}] {token} frac={res['frac']:.2f} rem={p.remaining:.2f}")
             else:

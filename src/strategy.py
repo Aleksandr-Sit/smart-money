@@ -29,7 +29,7 @@ _REQUIRED = {
                "STALE_SIGNAL_H", "MAX_ANOMALY_RATE", "PRIORITY_SILENCE_H",
                "WATCHLIST_MAX_AGE_D"],
     "tracking": ["TICK_S", "TRACK_S", "WS_CONNECTIONS", "RPC_PROVIDER", "MAX_SUBS_PER_CONN", "HIGH_RATE_WALLETS"],
-    "execution": ["SHADOW_CLIP_USD", "SLIPPAGE_BPS", "SHADOW_ENABLED", "LIVE_ENABLED",
+    "execution": ["SHADOW_CLIP_USD", "SLIPPAGE_BPS", "SHADOW_ENABLED", "LIVE_ENABLED", "SEND_PROVIDER",
                   "MAX_SWAP_USD", "MAX_PRIORITY_LAMPORTS", "PRIORITY_LEVEL",
                   "CONFIRM_TIMEOUT_S"],
     "sweep": ["ENABLED", "DRY_RUN", "SWEEP_ADDRESS", "SWEEP_TRIGGER_USD", "SWEEP_MIN_USD",
@@ -93,6 +93,11 @@ def _validate(cfg: dict[str, Any]) -> None:
         raise ValueError(f"strategy.yaml: MAX_SWAP_USD ${ex['MAX_SWAP_USD']} > половины банка")
     if ex["PRIORITY_LEVEL"] not in ("medium", "high", "veryHigh"):
         raise ValueError("strategy.yaml: PRIORITY_LEVEL = medium|high|veryHigh")
+    if ex["SEND_PROVIDER"] not in ("helius", "public"):
+        raise ValueError("strategy.yaml: SEND_PROVIDER должен быть helius или public")
+    if ex["LIVE_ENABLED"] and ex["SEND_PROVIDER"] == "public":
+        raise ValueError("strategy.yaml: живая торговля через публичный узел запрещена — "
+                         "он лимитирует sendTransaction и может не разослать сделку")
     if ex["LIVE_ENABLED"] and cfg["risk"]["RISK_MODE"] != "enforce":
         # реальные деньги без жёстких лимитов = дневной стоп не остановит слив
         raise ValueError("strategy.yaml: LIVE_ENABLED=true требует RISK_MODE=enforce")

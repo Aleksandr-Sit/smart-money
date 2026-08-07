@@ -116,6 +116,22 @@ class PositionManager:
             return {"action": "close", "reason": "dead"} if age_h > self.cfg["DEAD_AGE_H"] else None
         return None
 
+    def rollback_partial(self, token: str, frac: float, mult: float) -> None:
+        """Отменить учтённый частичный тейк: в live продажа могла не пройти.
+
+        check_price уменьшает remaining СРАЗУ, до отправки сделки. Если своп упал,
+        токены остались в кошельке — и без отката бот считал бы проданным то, чем
+        всё ещё владеет, а на выходе продал бы меньше, чем нужно.
+        """
+        p = self.pos.get(token)
+        if not p:
+            return
+        p.realized -= frac * (mult - 1)
+        p.remaining += frac
+        if p.taken:
+            p.taken.pop()
+        self._save()
+
     def close(self, token: str) -> Position | None:
         p = self.pos.pop(token, None)
         if p is not None:

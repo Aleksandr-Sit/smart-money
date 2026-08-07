@@ -37,6 +37,37 @@ def _cfg() -> dict:
     return strategy.EXECUTION
 
 
+def _settled_token_balance(mint: str, before: float, tries: int = 6) -> float:
+    """Дождаться, пока баланс токена изменится после подтверждённой сделки.
+
+    Подтверждение транзакции и чтение баланса могут прийти с разных слотов, а на
+    публичном узле — и с разных нод. Прочитав сразу, легко получить состояние ДО
+    сделки и записать в леджер мусорное проскальзывание. Ждём фактического сдвига.
+    """
+    last = before
+    for _ in range(tries):
+        bal, _ = token_balance(mint)
+        if abs(bal - before) > 1e-12:
+            return bal
+        last = bal
+        time.sleep(1.5)
+    return last
+
+
+def _settled_sol_balance(before: float | None, tries: int = 6) -> float | None:
+    """То же для SOL: ждём, пока баланс сдвинется после продажи."""
+    if before is None:
+        return None
+    last = before
+    for _ in range(tries):
+        bal = wallet.Wallet().balance_sol()
+        if bal is not None and abs(bal - before) > 1e-9:
+            return bal
+        last = bal if bal is not None else last
+        time.sleep(1.5)
+    return last
+
+
 def token_balance(mint: str) -> tuple[float, str | None]:
     """(количество токенов, адрес ATA). (0, None) если аккаунта нет."""
     w = wallet.Wallet()
@@ -146,6 +177,9 @@ def buy(mint: str, usd: float | None = None) -> dict:
     q = _quote(WSOL, mint, lamports)
     tokens_expected = int(q["outAmount"])
     quoted_price = usd / tokens_expected if tokens_expected else None
+    # баланс ДО сделки: считать цену по итоговому балансу нельзя — при повторном входе
+    # или после частичной продажи там лежат старые токены, и цена выйдет заниженной
+    bal_before, _ = token_balance(mint)
 
     iid = ledger.record_intent("buy", mint, quoted_price, clip_usd=usd,
                                reason="signal", mode="live" if _live() else "dry",
@@ -158,13 +192,18 @@ def buy(mint: str, usd: float | None = None) -> dict:
     swap = _build_swap_tx(q)               # содержит симуляцию: провал → исключение
     sig = _sign_and_send(swap)
     ok = confirm(sig)
-    got, _ = token_balance(mint)
-    actual_price = (usd / got) if got else None
+    bal_after = _settled_token_balance(mint, bal_before)
+    got = bal_after - bal_before           # КУПЛЕНО, а не всего на аккаунте
+    actual_price = (usd / got) if got > 0 else None
     slip = (actual_price / quoted_price - 1) if (actual_price and quoted_price) else None
     ledger.record_fill(iid, mint, actual_price, usd=usd, tokens=got, signature=sig,
-                       mode="live", extra={"confirmed": ok, "slippage_vs_quote": slip})
+                       mode="live", extra={"confirmed": ok, "slippage_vs_quote": slip,
+                                           "balance_before": bal_before, "balance_after": bal_after})
     if not ok:
         raise SwapError(f"покупка НЕ подтвердилась за таймаут, tx {sig} — проверить кошелёк")
+    if got <= 0:
+        # подтверждение есть, а токенов не прибавилось — расхождение, торговать вслепую нельзя
+        raise SwapError(f"покупка подтверждена, но баланс не вырос (tx {sig}) — проверить кошелёк")
     return {"action": "bought", "signature": sig, "tokens": got,
             "quoted_price": quoted_price, "actual_price": actual_price,
             "slippage_vs_quote": slip, "intent": iid}
@@ -202,11 +241,23 @@ def sell(mint: str, fraction: float = 1.0, reason: str = "exit") -> dict:
         return {"action": "dry_run", "intent": iid, "quoted_price": quoted_price,
                 "sol_out": sol_out, "fraction": fraction}
 
+    sol_before = w.balance_sol()
     swap = _build_swap_tx(q)
     sig = _sign_and_send(swap)
     ok = confirm(sig)
-    ledger.record_fill(iid, mint, quoted_price, usd=sol_out * sol_usd, tokens=bal * fraction,
-                       signature=sig, mode="live", extra={"confirmed": ok, "reason": reason})
+    # ФАКТ, а не котировка: раньше сюда писался quoted_price, поэтому измеренное
+    # проскальзывание по продажам было тождественно нулю — ради его замера всё и строилось
+    sol_after = _settled_sol_balance(sol_before)
+    sol_got = (sol_after - sol_before) if (sol_after is not None and sol_before is not None) else None
+    tokens_sold = bal * fraction
+    actual_price = (sol_got * sol_usd / tokens_sold) if (sol_got and tokens_sold) else None
+    slip = (actual_price / quoted_price - 1) if (actual_price and quoted_price) else None
+    ledger.record_fill(iid, mint, actual_price or quoted_price,
+                       usd=(sol_got * sol_usd) if sol_got else sol_out * sol_usd,
+                       tokens=tokens_sold, signature=sig, mode="live",
+                       extra={"confirmed": ok, "reason": reason, "quoted_price": quoted_price,
+                              "sol_quoted": sol_out, "sol_actual": sol_got,
+                              "slippage_vs_quote": slip})
     closed = None
     if ok and fraction >= 1.0:
         closed = close_token_account(mint)     # вернуть ренту ~$0.15

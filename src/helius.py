@@ -52,6 +52,17 @@ def _provider() -> str:
     return strategy.TRACKING.get("RPC_PROVIDER", "helius")
 
 
+def send_url() -> str:
+    """Узел для ОТПРАВКИ сделок. Отдельно от чтения: публичный узел не предназначен
+    для sendTransaction — он лимитирует и может молча не разослать транзакцию.
+    Читать с него безопасно, тратить деньги через него — нет."""
+    from . import strategy
+    who = strategy.EXECUTION.get("SEND_PROVIDER", "helius")
+    if who == "public":
+        return PUBLIC_RPC
+    return f"https://{RPC_HOST}/?api-key={secret('HELIUS_API_KEY')}"
+
+
 def rpc_url() -> str:
     if _provider() == "public":
         return PUBLIC_RPC
@@ -64,8 +75,13 @@ def ws_url() -> str:
     return f"wss://{RPC_HOST}/?api-key={secret('HELIUS_API_KEY')}"
 
 
+# Методы, отправляющие деньги: идут на send_url(), а не на общий узел чтения
+_SEND_METHODS = {"sendTransaction"}
+
+
 def rpc(method: str, params: list, timeout: int = 20) -> dict:
-    r = requests.post(rpc_url(), json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+    url = send_url() if method in _SEND_METHODS else rpc_url()
+    r = requests.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
                       timeout=timeout)
     r.raise_for_status()
     return r.json()
