@@ -394,6 +394,9 @@ async def run(max_mc: float, seconds: int | None) -> None:
                    f"SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}\n"
                    f"РИСК: {rm.status()}\n{ledger.summary()}\n"
                    f"КОШЕЛЁК: {hot_wallet.status()}\n{sweep.status()}")
+            # дублируем в stdout: 07.08 диагностика упёрлась в то, что пульс уходил
+            # только в Telegram и счётчики расхода RPC не было видно в docker logs
+            print(f"[пульс] {msg.splitlines()[0]}", flush=True)
             await loop.run_in_executor(None, delivery.send_heartbeat, msg)
 
             # --- контроль качества данных и потока (аудит-4) ---
