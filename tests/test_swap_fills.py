@@ -58,14 +58,26 @@ def _real_cfg():
     return copy.deepcopy(yaml.safe_load((root / "config" / "strategy.yaml").read_text(encoding="utf-8")))
 
 
-def test_живая_торговля_через_публичный_узел_запрещена():
-    """Конфиг обязан падать, а не молча слать деньги через узел без гарантий."""
+def test_чтение_и_отправка_через_один_узел_запрещены():
+    """Падение общего узла выключило бы и наблюдение, и выход из позиций сразу.
+    Пересмотр 07.08: сам по себе бесплатный узел не запрещён — опасно именно совмещение."""
     cfg = _real_cfg()
     cfg["risk"]["RISK_MODE"] = "enforce"
     cfg["execution"]["LIVE_ENABLED"] = True
+    cfg["tracking"]["RPC_PROVIDER"] = "public"
     cfg["execution"]["SEND_PROVIDER"] = "public"
-    with pytest.raises(ValueError, match="публичный узел"):
+    with pytest.raises(ValueError, match="один публичный узел"):
         strategy._validate(cfg)
+
+
+def test_разные_бесплатные_узлы_разрешены():
+    """Отправка через publicnode при чтении с public — разные пулы, риск разнесён."""
+    cfg = _real_cfg()
+    cfg["risk"]["RISK_MODE"] = "enforce"
+    cfg["execution"]["LIVE_ENABLED"] = True
+    cfg["tracking"]["RPC_PROVIDER"] = "public"
+    cfg["execution"]["SEND_PROVIDER"] = "publicnode"
+    strategy._validate(cfg)          # не должно бросать
 
 
 def test_живая_торговля_на_надёжном_узле_проходит():
@@ -82,12 +94,13 @@ def test_каждый_провайдер_отправки_даёт_свой_ад
     monkeypatch.setitem(strategy.TRACKING, "RPC_PROVIDER", "public")
     monkeypatch.setenv("DRPC_API_KEY", "тестовый-ключ")
     seen = {}
-    for who in ("public", "jito", "drpc"):
+    for who in ("public", "publicnode", "jito", "drpc"):
         monkeypatch.setitem(strategy.EXECUTION, "SEND_PROVIDER", who)
         seen[who] = helius.send_url()
     assert seen["jito"] == helius.JITO_SEND
     assert "solana" in seen["drpc"] and helius.DRPC_HOST in seen["drpc"]
-    assert len(set(seen.values())) == 3          # адреса различны, подмены нет
+    assert seen["publicnode"] == helius.PUBLICNODE_RPC
+    assert len(set(seen.values())) == 4          # адреса различны, подмены нет
 
 
 def test_неизвестный_провайдер_отправки_отвергается():

@@ -93,11 +93,16 @@ def _validate(cfg: dict[str, Any]) -> None:
         raise ValueError(f"strategy.yaml: MAX_SWAP_USD ${ex['MAX_SWAP_USD']} > половины банка")
     if ex["PRIORITY_LEVEL"] not in ("medium", "high", "veryHigh"):
         raise ValueError("strategy.yaml: PRIORITY_LEVEL = medium|high|veryHigh")
-    if ex["SEND_PROVIDER"] not in ("helius", "public", "drpc", "jito"):
-        raise ValueError("strategy.yaml: SEND_PROVIDER должен быть helius, drpc, jito или public")
-    if ex["LIVE_ENABLED"] and ex["SEND_PROVIDER"] == "public":
-        raise ValueError("strategy.yaml: живая торговля через публичный узел запрещена — "
-                         "он лимитирует sendTransaction и может не разослать сделку")
+    if ex["SEND_PROVIDER"] not in ("helius", "public", "publicnode", "drpc", "jito"):
+        raise ValueError("strategy.yaml: SEND_PROVIDER должен быть helius, drpc, jito, "
+                         "publicnode или public")
+    # Отправлять и читать через ОДИН узел нельзя: при его падении бот одновременно
+    # слепнет и теряет возможность закрыть позиции. Сам по себе бесплатный узел не
+    # запрещён — confirm() работает fail-closed, поэтому неудачная отправка стоит
+    # пропущенной сделки, а не потерянных денег (пересмотр запрета от 07.08).
+    if ex["LIVE_ENABLED"] and ex["SEND_PROVIDER"] == cfg["tracking"]["RPC_PROVIDER"] == "public":
+        raise ValueError("strategy.yaml: чтение и отправка через один публичный узел — "
+                         "его падение выключит и наблюдение, и выход из позиций")
     if ex["LIVE_ENABLED"] and cfg["risk"]["RISK_MODE"] != "enforce":
         # реальные деньги без жёстких лимитов = дневной стоп не остановит слив
         raise ValueError("strategy.yaml: LIVE_ENABLED=true требует RISK_MODE=enforce")
