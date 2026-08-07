@@ -174,13 +174,16 @@ async def run(max_mc: float, seconds: int | None) -> None:
         # СНАЧАЛА разбираем логи из самого уведомления — это бесплатно.
         # getTransaction остаётся лишь запасным путём: он стоил 97% всех кредитов
         # (242k/сутки, ~646 запросов на один полезный сигнал) и сжёг лимит за 4 дня.
-        trade = log_parse.parse_logs(logs or [], sig)
+        trade = log_parse.parse_logs(logs or [], sig, wallet)
         if trade is not None:
-            trade["ts"] = time.time()
+            trade["ts"] = time.time()   # время получения; блок отстаёт на 1 слот (0.4с)
             stats["from_logs"] += 1
         elif logs and not log_parse.is_trade(logs):
             return                      # заведомо не сделка — за транзакцией не ходим
         else:
+            # В логах сделки НАШЕГО кошелька нет (44% случаев — упоминание в чужой
+            # транзакции). Идём за getTransaction: он разберёт по балансам авторитетно
+            # и сам отсеет чужое. Часовой потолок не даст повторить инцидент 06.08.
             trade = await loop.run_in_executor(None, tx_parse.parse_trade, sig, wallet)
             if trade:
                 stats["from_rpc"] += 1

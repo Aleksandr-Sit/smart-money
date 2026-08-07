@@ -44,15 +44,10 @@ def is_trade(logs: list[str]) -> bool:
     return "Instruction: Buy" in txt or "Instruction: Sell" in txt
 
 
-def parse_logs(logs: list[str], signature: str = "") -> dict | None:
-    """Логи события → {side, token_mint, base_amount, sol, ts, source} или None.
-
-    Формат ответа совместим с tx_parse.parse_trade, чтобы монитор не переписывать.
-    None означает «это не разбираемая сделка» — тогда вызывающий может (по желанию)
-    сходить за getTransaction, но в норме этого не требуется.
-    """
-    if not logs or not is_trade(logs):
-        return None
+def _events(logs: list[str]) -> list[dict]:
+    """Все anchor-события сделок в логе. Их может быть несколько: агрегаторы и
+    бандлы кладут в одну транзакцию сделки разных участников и разных токенов."""
+    out = []
     for line in logs:
         if not line.startswith("Program data:"):
             continue
@@ -60,28 +55,60 @@ def parse_logs(logs: list[str], signature: str = "") -> dict | None:
             raw = base64.b64decode(line.split("Program data: ", 1)[1])
         except Exception:  # noqa: BLE001
             continue
-        if len(raw) < 57:
+        if len(raw) < 89:                      # нужен и хвост с полем user
             continue
         try:
             mint = b58encode(raw[8:40])
             sol_lamports, token_raw = struct.unpack_from("<QQ", raw, 40)
             is_buy = bool(raw[56])
+            user = b58encode(raw[57:89])
         except Exception:  # noqa: BLE001
             continue
         if not sol_lamports or not token_raw:
             continue
-        return {
-            "side": "buy" if is_buy else "sell",
-            "token_mint": mint,
-            "base_amount": token_raw / 1e6,      # pump.fun: 6 знаков
-            "sol": sol_lamports / 1e9,
-            "usd_proceeds": 0.0,
-            "fee": 0.0,                          # комиссия в логах не выделена; учтена в EXIT_FEE
-            "ts": None,                          # проставит вызывающий (время получения)
-            "source": "logs",
-            "signature": signature,
-        }
-    return None
+        out.append({"mint": mint, "user": user, "lamports": sol_lamports,
+                    "tokens": token_raw, "is_buy": is_buy})
+    return out
+
+
+def parse_logs(logs: list[str], signature: str = "", wallet: str = "") -> dict | None:
+    """Логи события → {side, token_mint, base_amount, sol, ts, source} или None.
+
+    ОБЯЗАТЕЛЬНО передавать wallet. Подписка `mentions` срабатывает на ЛЮБОЕ упоминание
+    адреса в транзакции — в том числе когда наш актор просто указан рефералом или
+    сосчитан в чужом бандле. Замер 07.08 на живом потоке: 44% событий содержали сделку
+    ЧУЖОГО кошелька. Без сверки поля `user` мы приписывали актору чужие покупки и
+    строили на них сигналы — win упал с 0.49 до 0.35.
+
+    Старый tx_parse такой ошибки не делал: он требовал `wallet in accountKeys` и считал
+    изменение баланса именно этого кошелька. Здесь тот же инвариант, но по полю user.
+
+    None означает «в логах нет сделки НАШЕГО кошелька» — вызывающий может сходить за
+    getTransaction, который разберёт транзакцию авторитетно, по балансам.
+    """
+    if not logs or not is_trade(logs):
+        return None
+    evs = _events(logs)
+    if not evs:
+        return None
+    if not wallet:
+        return None                            # без адреса сверить принадлежность нечем
+    mine = [e for e in evs if e["user"] == wallet]
+    if not mine:
+        return None
+    # если наш кошелёк торговал несколько раз в одной транзакции — берём крупнейшую по SOL
+    e = max(mine, key=lambda x: x["lamports"])
+    return {
+        "side": "buy" if e["is_buy"] else "sell",
+        "token_mint": e["mint"],
+        "base_amount": e["tokens"] / 1e6,        # pump.fun: 6 знаков
+        "sol": e["lamports"] / 1e9,
+        "usd_proceeds": 0.0,
+        "fee": 0.0,                              # комиссия в логах не выделена; учтена в EXIT_FEE
+        "ts": None,                              # проставит вызывающий (время получения)
+        "source": "logs",
+        "signature": signature,
+    }
 
 
 if __name__ == "__main__":     # живой самотест на публичном RPC (без ключей и без кредитов)
