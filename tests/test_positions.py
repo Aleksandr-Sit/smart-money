@@ -10,8 +10,14 @@ from src.positions import PositionManager, total_realized
 
 @pytest.fixture
 def pm(tmp_path, monkeypatch):
-    """Изолированный менеджер: стейт в tmp, не трогаем боевой output/."""
-    m = PositionManager()
+    """Изолированный менеджер: стейт в tmp, не трогаем боевой output/.
+
+    Частичные тейки задаём ЯВНО: в боевом конфиге они отключены (07.08, замер дал
+    +999$ без них), но механизм остаётся в коде и обязан работать, если его вернут.
+    Тест механизма не должен зависеть от текущего значения в strategy.yaml.
+    """
+    from src import strategy
+    m = PositionManager({**strategy.EXIT, "PARTIAL_TAKES": [(2.0, 0.5)]})
     m.path = tmp_path / "open_positions.json"
     m.pos = {}
     return m

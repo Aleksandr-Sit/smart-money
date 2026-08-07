@@ -65,7 +65,10 @@ def test_окно_конфлюенса_истекает():
 # ---------- конфиг стратегии ----------
 def test_конфиг_загружается_и_версионирован():
     assert strategy.VERSION and isinstance(strategy.VERSION, str)
-    assert strategy.EXIT["PARTIAL_TAKES"] and isinstance(strategy.EXIT["PARTIAL_TAKES"][0], tuple)
+    # 07.08: тейки отключены по замеру (+999$ без них). Пустой список допустим,
+    # но если список НЕ пуст — элементы обязаны быть парами (множитель, доля).
+    assert isinstance(strategy.EXIT["PARTIAL_TAKES"], list)
+    assert all(isinstance(x, tuple) and len(x) == 2 for x in strategy.EXIT["PARTIAL_TAKES"])
 
 
 def test_валидация_ловит_битые_пороги(tmp_path):

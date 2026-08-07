@@ -12,8 +12,10 @@ from src import positions, strategy
 
 
 def _pm(tmp_path, monkeypatch):
+    """Тейки задаём явно: в боевом конфиге они отключены, но откат тейка — это
+    код, который обязан работать корректно, если механизм вернут."""
     monkeypatch.setattr(positions.config, "OUTPUT_DIR", tmp_path, raising=False)
-    pm = positions.PositionManager()
+    pm = positions.PositionManager({**strategy.EXIT, "PARTIAL_TAKES": [(2.0, 0.5)]})
     pm.path = tmp_path / "open_positions.json"
     pm.pos = {}
     return pm
