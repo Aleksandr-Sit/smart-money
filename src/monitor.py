@@ -56,6 +56,25 @@ def tradable(signal) -> tuple[bool, str]:
     return False, "weak без приоритетных (убыточная когорта)"
 
 
+def sanitize_price(price: float | None, ref: float | None, jump: float) -> tuple[float | None, bool]:
+    """Отсеять невозможную цену. → (цена_к_использованию, была_ли_аномалия).
+
+    Вынесена из замыкания намеренно: это единственная защита от мусора источника
+    на путях «сделка» и «запасная котировка», и она обязана быть под тестом.
+
+    При аномалии возвращаем ОПОРНУЮ цену, а не None: позиция должна продолжать
+    оцениваться по здравому значению. Вернуть None означало бы «цены нет», и выход
+    сработал бы вслепую — ровно та ошибка, что стоила −100% на выпуске токена (08.08).
+    """
+    if not price or price <= 0:
+        return None, False
+    if ref and ref > 0:
+        ratio = price / ref
+        if ratio > jump or ratio < 1 / jump:
+            return ref, True
+    return price, False
+
+
 def _split(items: list, n: int) -> list[list]:
     return [items[i::n] for i in range(min(n, len(items)))] if items else []
 
@@ -88,29 +107,47 @@ async def run(max_mc: float, seconds: int | None) -> None:
              "started": time.time(), "last_signal_ts": time.time()}
     loop = asyncio.get_event_loop()
 
-    def sane_price(token: str, price: float | None) -> float | None:
-        """Санитарная проверка цены ИЗ СДЕЛКИ (аудит-5).
+    def sane_price(token: str, price: float | None, src: str = "trade") -> float | None:
+        """Санитарная проверка цены. Применяется на ВСЕХ путях, кроме трекера,
+        у которого свой такой же фильтр.
 
-        Пылевая продажа (крошечный base_amount в знаменателе) даёт абсурдную цену:
-        в проде поймано 2 случая по $76k–152k за токен → одна запись раздула mean PnL
-        до +908 000 000%. Фильтр из Фазы A закрывал только траектории, этот путь — нет.
+        Путь "trade" (аудит-5): пылевая продажа с крошечным base_amount в знаменателе
+        даёт абсурдную цену — в проде поймано 2 случая по $76k–152k за токен, одна
+        запись раздула mean PnL до +908 000 000%.
+
+        Путь "fallback" (08.08): при выпуске токена на DEX фильтр трекера отбрасывает
+        тик, монитор идёт за котировкой Jupiter, а та в момент миграции пула отдаёт
+        мусор. Проверки здесь не было — мусор заходил через эту дверь и закрывал
+        позицию с −100% ровно на лучших токенах.
+
         Сверяем с последней известной хорошей ценой (трекер или вход позиции).
+        При аномалии возвращаем опорную цену, а не None: позиция должна продолжать
+        оцениваться по здравому значению, а не закрываться вслепую.
         """
-        if not price or price <= 0:
-            return None
         pos = pm.get(token)
         ref = tracker.last.get(token) or (pos.entry_price if pos else None)
-        if ref and ref > 0:
-            ratio = price / ref
-            if ratio > tracker.SANITY_JUMP or ratio < 1 / tracker.SANITY_JUMP:
-                tracker.anomalies += 1
-                print(f"[trade] SKIP аномальная цена {token[:8]}: {price:.3e} "
-                      f"(ref {ref:.3e}, {ratio:.1e}x) → берём ref")
-                return ref            # опорная цена вместо мусорной
-        return price
+        out, anomaly = sanitize_price(price, ref, tracker.SANITY_JUMP)
+        if anomaly:
+            tracker.anomalies += 1
+            print(f"[{src}] SKIP аномальная цена {token[:8]}: {price:.3e} "
+                  f"(ref {ref:.3e}, {price/ref:.1e}x) → берём ref")
+        return out
 
     def _fallback_price(token: str) -> float | None:
-        """Резервный источник цены: котировка Jupiter на клип. None = маршрута нет."""
+        """Резервный источник цены: котировка Jupiter на клип. None = маршрута нет.
+
+        Результат ОБЯЗАТЕЛЬНО через sane_price. Санитарная проверка стояла в трекере
+        и в разборе сделок, но не здесь — и мусор заходил через эту дверь (08.08).
+
+        Разбор случая CgWJ5NBN…: токен выпустился с бондинг-кривой на DEX, чтение
+        кривой стало бессмысленным, фильтр трекера этот тик корректно отбросил — и
+        тем самым отправил монитор сюда. Jupiter в момент миграции пула отдал
+        котировку, дающую цену 4.7e-11 при последней честной 2.8e-05. Трейлинг был
+        взведён (пик 3.03x) и закрыл позицию с −100%. Через 30 секунд реальная цена
+        была 5.07x от входа.
+
+        Выпуск на DEX проходят 16.2% токенов — по определению лучшие из наших.
+        """
         try:
             q = execution.quote(execution.WSOL, token,
                                 int(rm.clip / market.sol_price() * 1e9),
@@ -118,7 +155,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
             if not q or not q.get("outAmount"):
                 return None
             tokens = int(q["outAmount"])
-            return (rm.clip / tokens) if tokens > 0 else None
+            return sane_price(token, (rm.clip / tokens) if tokens > 0 else None, "fallback")
         except Exception:  # noqa: BLE001
             return None
 
