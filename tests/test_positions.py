@@ -12,12 +12,14 @@ from src.positions import PositionManager, total_realized
 def pm(tmp_path, monkeypatch):
     """Изолированный менеджер: стейт в tmp, не трогаем боевой output/.
 
-    Частичные тейки задаём ЯВНО: в боевом конфиге они отключены (07.08, замер дал
-    +999$ без них), но механизм остаётся в коде и обязан работать, если его вернут.
-    Тест механизма не должен зависеть от текущего значения в strategy.yaml.
+    Тейки, стоп и порог акторов задаём ЯВНО: в боевом конфиге тейки и стоп
+    отключены (07.08), порог снижен до 0.25 (08.08). Механизмы остаются в коде и
+    обязаны работать при любых значениях, поэтому тест механизма не должен
+    зависеть от текущей настройки. Боевые значения проверяются отдельными тестами.
     """
     from src import strategy
-    m = PositionManager({**strategy.EXIT, "PARTIAL_TAKES": [(2.0, 0.5)], "SL_MULT": 0.5})
+    m = PositionManager({**strategy.EXIT, "PARTIAL_TAKES": [(2.0, 0.5)],
+                         "SL_MULT": 0.5, "EXIT_ACTOR_FRAC": 0.5})
     m.path = tmp_path / "open_positions.json"
     m.pos = {}
     return m
@@ -138,3 +140,39 @@ def test_боевой_конфиг_без_стопа_и_тейка():
     assert strategy.EXIT["PARTIAL_TAKES"] == []
     assert strategy.EXIT["TP_MULT"] == 6.0        # тейк 6x остаётся
     assert strategy.EXIT["MAX_HOLD_S"] == 1800    # таймаут остаётся
+
+
+def test_порог_выхода_одна_продажа_до_четырёх_акторов(tmp_path):
+    """08.08: FRAC 0.25 — одной продажи достаточно при 2–4 акторах.
+
+    Раньше при 0.5 позиция «вышел 1 из 3» продолжала висеть до таймаута с
+    медианой −40.2%. Мы следуем за акторами на входе — следуем и на выходе.
+    """
+    from src import strategy
+    for n_actors, need in ((2, 1), (3, 1), (4, 1), (5, 2), (6, 2)):
+        pm = PositionManager({**strategy.EXIT, "EXIT_ACTOR_FRAC": 0.25})
+        pm.path = tmp_path / f"p{n_actors}.json"
+        pm.pos = {}
+        actors = [f"a{i}" for i in range(n_actors)]
+        pm.open("TOK", 0.001, 1e6, actors, 1000)
+        for i in range(need - 1):
+            assert pm.on_sell("TOK", actors[i]) is None, f"{n_actors} акт.: выход на {i+1}-й рано"
+        assert pm.on_sell("TOK", actors[need - 1]) == "actors_exit", \
+            f"{n_actors} акторов: выход должен быть на {need}-й продаже"
+
+
+def test_повторная_продажа_того_же_актора_не_считается(tmp_path):
+    """Иначе один актор, продающий частями, выбил бы позицию досрочно."""
+    from src import strategy
+    pm = PositionManager({**strategy.EXIT, "EXIT_ACTOR_FRAC": 0.25})
+    pm.path = tmp_path / "p.json"
+    pm.pos = {}
+    pm.open("TOK", 0.001, 1e6, ["a1", "a2", "a3", "a4", "a5"], 1000)   # need = 2
+    assert pm.on_sell("TOK", "a1") is None
+    assert pm.on_sell("TOK", "a1") is None          # тот же актор второй раз
+    assert pm.on_sell("TOK", "a2") == "actors_exit"
+
+
+def test_боевой_порог_зафиксирован():
+    from src import strategy
+    assert strategy.EXIT["EXIT_ACTOR_FRAC"] == 0.25
