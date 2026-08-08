@@ -12,14 +12,14 @@ from src.positions import PositionManager, total_realized
 def pm(tmp_path, monkeypatch):
     """Изолированный менеджер: стейт в tmp, не трогаем боевой output/.
 
-    Тейки, стоп и порог акторов задаём ЯВНО: в боевом конфиге тейки и стоп
-    отключены (07.08), порог снижен до 0.25 (08.08). Механизмы остаются в коде и
-    обязаны работать при любых значениях, поэтому тест механизма не должен
+    Все параметры выхода задаём ЯВНО: в бою тейки и стоп отключены (07.08), порог
+    акторов снижен до 0.25, таймаут сокращён до 5 минут (08.08). Механизмы остаются
+    в коде и обязаны работать при любых значениях, поэтому тест механизма не должен
     зависеть от текущей настройки. Боевые значения проверяются отдельными тестами.
     """
     from src import strategy
-    m = PositionManager({**strategy.EXIT, "PARTIAL_TAKES": [(2.0, 0.5)],
-                         "SL_MULT": 0.5, "EXIT_ACTOR_FRAC": 0.5})
+    m = PositionManager({**strategy.EXIT, "PARTIAL_TAKES": [(2.0, 0.5)], "SL_MULT": 0.5,
+                         "EXIT_ACTOR_FRAC": 0.5, "MAX_HOLD_S": 1800})
     m.path = tmp_path / "open_positions.json"
     m.pos = {}
     return m
@@ -115,7 +115,8 @@ def test_стоп_отключается_нулём(tmp_path):
     Мёртвый токен закрывается отдельным правилом DEAD_AGE_H.
     """
     from src import strategy
-    pm = PositionManager({**strategy.EXIT, "SL_MULT": 0.0, "PARTIAL_TAKES": []})
+    pm = PositionManager({**strategy.EXIT, "SL_MULT": 0.0, "PARTIAL_TAKES": [],
+                          "MAX_HOLD_S": 1800})
     pm.path = tmp_path / "p.json"
     pm.pos = {}
     pm.open("TOK", 0.001, 1e6, ["a1", "a2"], 1000)
@@ -126,7 +127,8 @@ def test_стоп_отключается_нулём(tmp_path):
 def test_стоп_работает_если_его_вернуть(tmp_path):
     """Механизм остаётся рабочим: положительный SL_MULT снова закрывает позицию."""
     from src import strategy
-    pm = PositionManager({**strategy.EXIT, "SL_MULT": 0.5, "PARTIAL_TAKES": []})
+    pm = PositionManager({**strategy.EXIT, "SL_MULT": 0.5, "PARTIAL_TAKES": [],
+                          "MAX_HOLD_S": 1800})
     pm.path = tmp_path / "p.json"
     pm.pos = {}
     pm.open("TOK", 0.001, 1e6, ["a1", "a2"], 1000)
@@ -139,7 +141,7 @@ def test_боевой_конфиг_без_стопа_и_тейка():
     assert strategy.EXIT["SL_MULT"] == 0.0
     assert strategy.EXIT["PARTIAL_TAKES"] == []
     assert strategy.EXIT["TP_MULT"] == 6.0        # тейк 6x остаётся
-    assert strategy.EXIT["MAX_HOLD_S"] == 1800    # таймаут остаётся
+    assert strategy.EXIT["MAX_HOLD_S"] == 300     # 08.08: сокращён с 1800
 
 
 def test_порог_выхода_одна_продажа_до_четырёх_акторов(tmp_path):
@@ -176,3 +178,33 @@ def test_повторная_продажа_того_же_актора_не_сч�
 def test_боевой_порог_зафиксирован():
     from src import strategy
     assert strategy.EXIT["EXIT_ACTOR_FRAC"] == 0.25
+
+
+def test_таймаут_пять_минут(tmp_path):
+    """08.08: MAX_HOLD_S 1800 → 300. Длинный таймаут не защищал, а давал застрявшим
+    позициям догнивать: 83% таймаутов имели пик ниже 1.5x, где трейлинг недоступен."""
+    from src import strategy
+    pm = PositionManager({**strategy.EXIT})
+    pm.path = tmp_path / "p.json"
+    pm.pos = {}
+    pm.open("TOK", 0.001, 1e6, ["a1", "a2"], 1000)
+    assert pm.check_price("TOK", 0.0011, 4 / 60) is None                    # 4 мин — рано
+    assert pm.check_price("TOK", 0.0011, 5.1 / 60)["reason"] == "timeout"   # 5.1 мин
+
+
+def test_dead_перекрыт_таймаутом_осознанно():
+    """DEAD_AGE_H=1ч недостижим при таймауте 5 мин: check_price проверяет таймаут
+    раньше. Фиксируем соотношение, чтобы «мёртвая защита» не выглядела рабочей.
+    Если таймаут когда-нибудь вернут длиннее часа — тест напомнит пересмотреть."""
+    from src import strategy
+    assert strategy.EXIT["MAX_HOLD_S"] < strategy.EXIT["DEAD_AGE_H"] * 3600
+
+
+def test_быстрые_сделки_таймаут_не_трогает(tmp_path):
+    """Медиана удержания 24с, p90 5.1 мин — 90% сделок правка не касается."""
+    from src import strategy
+    pm = PositionManager({**strategy.EXIT})
+    pm.path = tmp_path / "q.json"
+    pm.pos = {}
+    pm.open("TOK", 0.001, 1e6, ["a1", "a2"], 1000)
+    assert pm.check_price("TOK", 0.0012, 24 / 3600) is None    # 24 секунды
