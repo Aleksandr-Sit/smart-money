@@ -102,6 +102,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
     seen_sigs: set[str] = set()
     seen_order: deque[str] = deque()      # FIFO-эвикция: не сбрасываем дедуп разом
     pos_intent: dict[str, str] = {}       # token -> id намерения в леджере
+    exiting: set[str] = set()             # токены в процессе выхода — защёлка от гонки
     stats = {"signals": 0, "strong": 0, "quiet": 0, "alerts": 0, "opens": 0, "exits": 0,
              "skipped_unsellable": 0, "skipped_rule": 0, "from_logs": 0, "from_rpc": 0,
              "started": time.time(), "last_signal_ts": time.time()}
@@ -227,6 +228,31 @@ async def run(max_mc: float, seconds: int | None) -> None:
         return True
 
     async def emit_exit(token: str, exit_price: float | None, reason: str) -> None:
+        """Закрыть позицию. ИДЕМПОТЕНТНО: повторный вызов по тому же токену молча выйдет.
+
+        Аудит 08.08 нашёл гонку, жившую с 12 июля: две продажи разных акторов приходят
+        почти одновременно, первая запускает emit_exit, тот отдаёт управление на await
+        (замер фрикции), вторая успевает пройти on_sell — порог снова достигнут — и
+        запускает ВТОРОЙ emit_exit. Оба видят позицию открытой, потому что pm.close()
+        стоит в самом конце. Замер: 77 позиций закрыты дважды, у 99% разрыв меньше
+        секунды (медиана 42 мс), PnL посчитан дважды на −$20.9.
+
+        В бумажном режиме это искажало risk_state.realized_usd, от которого зависит
+        дневной стоп — предохранитель срабатывал раньше срока. В live это две команды
+        на продажу одной позиции и двойная комиссия.
+
+        Закрывать позицию в начале вместо конца нельзя: сломается откат при неудачной
+        продаже в live, где позиция обязана остаться нашей.
+        """
+        if token in exiting:
+            return
+        exiting.add(token)
+        try:
+            await _emit_exit(token, exit_price, reason)
+        finally:
+            exiting.discard(token)
+
+    async def _emit_exit(token: str, exit_price: float | None, reason: str) -> None:
         p = pm.get(token)
         if not p:
             return
