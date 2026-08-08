@@ -7,6 +7,7 @@ Telegram шлёт, если в .env есть TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 
@@ -106,15 +107,36 @@ _REASON_TXT = {"actors_exit": "акторы вышли", "take_profit": "тей�
 
 
 def format_exit(pos, exit_price: float, reason: str, realized_pnl: float) -> str:
+    """Сообщение о выходе. Включает параметры ВХОДА намеренно.
+
+    С 07.08 правило входа "all" — торгуем каждый сигнал, но уведомления о входе
+    уходят только для отобранных классов. Возникла асимметрия: объявляем все
+    выходы и лишь часть входов, из-за чего сообщение о выходе выглядит сиротой,
+    и владелец не может найти, когда и по чему мы вошли (жалоба 08.08).
+    Слать вход по каждой сделке нельзя — это ~200 сообщений в сутки, поэтому
+    пара восстанавливается прямо здесь.
+    """
     lk = _links(pos.token_mint)
     emoji = "🟢" if realized_pnl >= 0 else "🔴"
-    return (
-        f"🔻 EXIT [{_REASON_TXT.get(reason, reason)}] {emoji} realized {realized_pnl:+.0%}\n"
-        f"token: {pos.token_mint}\n"
-        f"вышло акторов: {len(pos.exited_actors)}/{len(pos.entry_actors)}\n"
-        f"вход MC {_fmt_usd(pos.entry_mc)} → выход ~{_fmt_usd((exit_price or 0) * 1_000_000_000)}\n"
-        f"📈 {lk['dexscreener']}"
-    )
+    held = (time.time() - pos.entry_ts) if pos.entry_ts else None
+    held_txt = ("?" if held is None else
+                f"{held/60:.0f} мин" if held >= 60 else f"{held:.0f} с")
+    entered = (datetime.fromtimestamp(pos.entry_ts, timezone.utc).strftime("%H:%M:%S")
+               if pos.entry_ts else "?")
+
+    def _x(p):
+        return f"{p/pos.entry_price:.2f}x" if (p and pos.entry_price) else "?"
+
+    lines = [
+        f"🔻 EXIT [{_REASON_TXT.get(reason, reason)}] {emoji} realized {realized_pnl:+.0%}",
+        f"token: {pos.token_mint}",
+        f"ВХОД {entered} UTC · акторов {len(pos.entry_actors)} · MC {_fmt_usd(pos.entry_mc)}",
+        f"держали {held_txt} · пик {_x(pos.peak_price)} · выход {_x(exit_price)}",
+        f"вышло акторов: {len(pos.exited_actors)}/{len(pos.entry_actors)}",
+        f"выход MC ~{_fmt_usd((exit_price or 0) * 1_000_000_000)}",
+        f"📈 {lk['dexscreener']}",
+    ]
+    return "\n".join(lines)
 
 
 def deliver_exit(pos, exit_price: float, reason: str, telegram: bool = True) -> None:
