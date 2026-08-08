@@ -475,30 +475,18 @@ async def run(max_mc: float, seconds: int | None) -> None:
                 return "ok" if r.get("result") == "ok" else "?"
             except Exception:  # noqa: BLE001
                 return "нет связи"
-        # пульс при старте — подтверждает, что новый деплой поднялся
-        await loop.run_in_executor(None, delivery.send_heartbeat,
-                                   f"монитор запущен · {len(wallets)} кош./{len(batches)} WS · "
-                                   f"SOL=${market.sol_price():.2f} · открытых={len(pm.open_tokens())}")
         prev_anom = 0
-        while True:
-            await asyncio.sleep(HEARTBEAT_S)
-            up_h = (time.time() - stats["started"]) / 3600
-            msg = (f"жив {up_h:.0f}ч · v{strategy.VERSION} · сигналов={stats['signals']} "
-                   f"(strong={stats['strong']} тихих={stats['quiet']} алертов={stats['alerts']}) · "
-                   f"входов={stats['opens']} выходов={stats['exits']} · открытых={len(pm.open_tokens())} · "
-                   f"трек={len(tracker.active)} · аном={tracker.anomalies} · "
-                   f"непродаваемых={stats['skipped_unsellable']} правилом={stats['skipped_rule']} · "
-                   f"сделок из логов={stats['from_logs']} через RPC={stats['from_rpc']} "
-                   f"(бюджет {helius.budget_report()}) · "
-                   f"SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}\n"
-                   f"РИСК: {rm.status()}\n{ledger.summary()}\n"
-                   f"КОШЕЛЁК: {hot_wallet.status()}\n{sweep.status()}")
-            # дублируем в stdout: 07.08 диагностика упёрлась в то, что пульс уходил
-            # только в Telegram и счётчики расхода RPC не было видно в docker logs
-            print(f"[пульс] {msg.splitlines()[0]}", flush=True)
-            await loop.run_in_executor(None, delivery.send_heartbeat, msg)
 
-            # --- контроль качества данных и потока (аудит-4) ---
+        async def check_quality() -> None:
+            """Контроль качества данных и потока. Вызывается ПРИ СТАРТЕ и в каждом пульсе.
+
+            Аудит 08.08: раньше эти проверки жили только внутри шестичасового цикла,
+            который начинался со sleep. За всё время работы они не выполнились НИ РАЗУ —
+            деплои случались чаще, чем раз в шесть часов, и каждый обнулял таймер.
+            Из-за этого watchlist протух до 28.8 дней при пороге 7, и никто не узнал.
+            Проверки молчат, когда всё в порядке, поэтому частый вызов не спамит.
+            """
+            nonlocal prev_anom
             problems = []
             new_anom = tracker.anomalies - prev_anom
             prev_anom = tracker.anomalies
@@ -517,7 +505,32 @@ async def run(max_mc: float, seconds: int | None) -> None:
                 problems.append(f"RPC-сбоев трекера: {tracker.rpc_fails}")
                 tracker.rpc_fails = 0
             if problems:
+                print("[качество] " + " · ".join(problems), flush=True)
                 await loop.run_in_executor(None, delivery.send_alert, " · ".join(problems))
+
+        # пульс при старте — подтверждает, что новый деплой поднялся
+        await loop.run_in_executor(None, delivery.send_heartbeat,
+                                   f"монитор запущен · {len(wallets)} кош./{len(batches)} WS · "
+                                   f"SOL=${market.sol_price():.2f} · открытых={len(pm.open_tokens())}")
+        await check_quality()          # ← проверки СРАЗУ, не через шесть часов
+        while True:
+            await asyncio.sleep(HEARTBEAT_S)
+            up_h = (time.time() - stats["started"]) / 3600
+            msg = (f"жив {up_h:.0f}ч · v{strategy.VERSION} · сигналов={stats['signals']} "
+                   f"(strong={stats['strong']} тихих={stats['quiet']} алертов={stats['alerts']}) · "
+                   f"входов={stats['opens']} выходов={stats['exits']} · открытых={len(pm.open_tokens())} · "
+                   f"трек={len(tracker.active)} · аном={tracker.anomalies} · "
+                   f"непродаваемых={stats['skipped_unsellable']} правилом={stats['skipped_rule']} · "
+                   f"сделок из логов={stats['from_logs']} через RPC={stats['from_rpc']} "
+                   f"(бюджет {helius.budget_report()}) · "
+                   f"SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}\n"
+                   f"РИСК: {rm.status()}\n{ledger.summary()}\n"
+                   f"КОШЕЛЁК: {hot_wallet.status()}\n{sweep.status()}")
+            # дублируем в stdout: 07.08 диагностика упёрлась в то, что пульс уходил
+            # только в Telegram и счётчики расхода RPC не было видно в docker logs
+            print(f"[пульс] {msg.splitlines()[0]}", flush=True)
+            await loop.run_in_executor(None, delivery.send_heartbeat, msg)
+            await check_quality()
 
     async def exit_tick(prices: dict) -> None:
         """Выходы на 15с-цикле трекера (было 90с — на такой гранулярности edge исчезал, см. аудит).
