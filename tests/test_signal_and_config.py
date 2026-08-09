@@ -116,3 +116,39 @@ def test_разбор_кривой_и_грэдуэйшн():
     assert c and c["complete"] is False and c["price_sol"] > 0
     done = b"\x00" * 8 + struct.pack("<QQQQQ?", 0, 0, 0, 0, 10**15, True)
     assert price_track.parse_curve(done) is None     # грэдуировал → фолбэк на DexScreener
+
+
+def test_акторы_в_порядке_первой_покупки():
+    """actors[0] обязан быть тем, кто зашёл ПЕРВЫМ.
+
+    Аудит 09.08: при ротации watchlist нужно понимать, потеряем ли мы сигнал
+    совсем, исключив актора, или просто войдём позже с другим составом. Порядок
+    держится на хронологичности st["buys"] и на том, что dict сохраняет порядок
+    вставки — оба свойства неявные, поэтому закреплены тестом.
+    """
+    from src.signal_engine import BuyEvent, SignalEngine
+    amap = {f"w{i}": (f"actor{i}", 1.0) for i in range(4)}
+    eng = SignalEngine(amap, {"CONFLUENCE_N": 2, "STRONG_CONFLUENCE_N": 3,
+                              "CONFLUENCE_WINDOW_S": 600, "QUIET_MAX_USD": 250,
+                              "SIGNAL_MAX_MC_USD": 10**9, "SIGNAL_MAX_AGE_S": 10**9,
+                              "SIGNAL_MIN_USD": 1})
+    # заходят в порядке 2 → 0 → 1
+    for i, w in enumerate(("w2", "w0", "w1")):
+        sig = eng.process(BuyEvent(ts=1000.0 + i, token_mint="TOK", wallet=w, usd=50.0))
+    assert sig is not None
+    assert sig.actors[0] == "actor2", f"первым зашёл actor2, а в списке {sig.actors}"
+    assert sig.actors[:3] == ["actor2", "actor0", "actor1"]
+
+
+def test_повторная_покупка_не_меняет_порядок():
+    """DCA того же актора не должна двигать его в конец списка."""
+    from src.signal_engine import BuyEvent, SignalEngine
+    amap = {"wA": ("actorA", 1.0), "wB": ("actorB", 1.0)}
+    eng = SignalEngine(amap, {"CONFLUENCE_N": 2, "STRONG_CONFLUENCE_N": 3,
+                              "CONFLUENCE_WINDOW_S": 600, "QUIET_MAX_USD": 250,
+                              "SIGNAL_MAX_MC_USD": 10**9, "SIGNAL_MAX_AGE_S": 10**9,
+                              "SIGNAL_MIN_USD": 1})
+    eng.process(BuyEvent(ts=1000.0, token_mint="TOK", wallet="wA", usd=50.0))
+    eng.process(BuyEvent(ts=1001.0, token_mint="TOK", wallet="wA", usd=50.0))   # DCA
+    sig = eng.process(BuyEvent(ts=1002.0, token_mint="TOK", wallet="wB", usd=50.0))
+    assert sig is not None and sig.actors == ["actorA", "actorB"]
