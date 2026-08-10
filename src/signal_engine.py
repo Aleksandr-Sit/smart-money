@@ -61,16 +61,58 @@ def load_actor_map(path: Path | None = None) -> dict[str, tuple[str, float]]:
     return m
 
 
+# Уборка состояния токенов (аудит 10.08). Словарь self.tokens рос без ограничений: запись
+# заводилась на КАЖДЫЙ увиденный токен и не удалялась никогда, а окно покупок подрезалось
+# только когда по этому токену приходило новое событие. Мёртвый токен уносил свой список
+# покупок навсегда. Замер по памяти контейнера: 272.6 -> 273.2 МиБ за 24 минуты, около
+# 36 МБ в сутки (две точки, оценка грубая; неограниченность структуры при этом — факт).
+PRUNE_EVERY = 500        # как часто убирать: раз в N событий, чтобы не платить на каждом
+MAX_TOKENS = 50_000      # потолок числа токенов в памяти; сверх него вытесняем самые старые
+
+
 class SignalEngine:
     def __init__(self, actor_map: dict[str, tuple[str, float]], cfg: dict | None = None):
         self.actor_map = actor_map
         self.cfg = {**DEFAULTS, **(cfg or {})}
         self.tokens: dict[str, dict] = {}
+        self._since_prune = 0
+
+    def _prune(self, now: float) -> int:
+        """Освободить память, НЕ меняя решений движка. → сколько записей затронуто.
+
+        Две ступени, и первая важнее второй:
+
+        1. У токенов, чьё окно уже истекло, очищаем список покупок. Поведение при этом
+           не меняется ни на йоту: приди по такому токену событие, цикл popleft всё
+           равно выбросил бы эти покупки первым же делом. Память они занимают, а решают
+           ноль. Счётчик last_n СОХРАНЯЕМ: он не даёт повторно сигналить на том же
+           уровне конфлюенса, и его сброс был бы уже изменением правила входа.
+
+        2. Если токенов всё равно больше потолка — вытесняем самые старые целиком.
+           Тут last_n теряется, поэтому ступень стоит второй и срабатывает только на
+           токенах, по которым давно ничего не происходило.
+        """
+        win = self.cfg["CONFLUENCE_WINDOW_S"]
+        touched = 0
+        for st in self.tokens.values():
+            if st["buys"] and now - st["buys"][-1][0] > win:
+                st["buys"].clear()
+                touched += 1
+        if len(self.tokens) > MAX_TOKENS:
+            # dict сохраняет порядок вставки → первые ключи и есть самые старые
+            for m in list(self.tokens)[:len(self.tokens) - MAX_TOKENS]:
+                del self.tokens[m]
+                touched += 1
+        return touched
 
     def process(self, ev: BuyEvent) -> Signal | None:
         info = self.actor_map.get(ev.wallet)
         if not info or ev.usd < self.cfg["SIGNAL_MIN_USD"]:
             return None
+        self._since_prune += 1
+        if self._since_prune >= PRUNE_EVERY:
+            self._since_prune = 0
+            self._prune(ev.ts)
         # ПРИМЕЧАНИЕ (аудит-6): гейты по MC/возрасту УДАЛЕНЫ. Они никогда не срабатывали
         # (BuyEvent создаётся без token_mc), а замер показал, что включать их ВРЕДНО:
         # сигналы с MC>100k — лучшая когорта (win 0.57 против 0.42 в среднем).

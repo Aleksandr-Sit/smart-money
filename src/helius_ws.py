@@ -74,6 +74,7 @@ async def subscribe_wallets(wallets: list[str], on_event: Callable[[str, str], A
             async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=None) as ws:
                 pending = {}   # request id -> wallet
                 sub_to_wallet = {}   # subscription id -> wallet
+                max_slot = 0   # наибольший слот В ЭТОМ соединении (счётчик возраста события)
                 for i, w in enumerate(wallets):
                     pending[i] = w
                     await ws.send(json.dumps({
@@ -108,11 +109,20 @@ async def subscribe_wallets(wallets: list[str], on_event: Callable[[str, str], A
                             continue
                         w = sub_to_wallet.get(m["params"]["subscription"])
                         sig = val.get("signature")
+                        # СЛОТ уведомления — единственный признак возраста на этом пути:
+                        # разбор из логов не даёт blockTime, и монитор проставляет время
+                        # получения, из-за чего проверка протухания там не работала вовсе
+                        # (аудит 10.08). Отставание считаем ВНУТРИ соединения: каналы могут
+                        # идти вразнобой, и общий максимум забраковал бы отстающий канал целиком.
+                        slot = ((m["params"]["result"].get("context") or {}).get("slot")) or 0
+                        if slot > max_slot:
+                            max_slot = slot
+                        lag = (max_slot - slot) if slot else 0
                         if w and sig:
                             last_sig[w] = sig          # запомнить последнюю для backfill
                             # ЛОГИ идут вместе с уведомлением — в них есть вся сделка.
                             # Передаём их дальше, чтобы не платить за getTransaction (инцидент 06.08).
-                            await on_event(w, sig, val.get("logs") or [])
+                            await on_event(w, sig, val.get("logs") or [], lag)
         except Exception as e:  # noqa: BLE001
             attempt += 1
             rate_limited = "429" in str(e)

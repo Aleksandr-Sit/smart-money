@@ -13,7 +13,7 @@ import argparse
 import asyncio
 import json
 import time
-from collections import deque
+from collections import Counter, deque
 
 from . import (config, delivery, execution, helius, helius_ws, ledger, market, orphans, positions,
                price_track, log_parse, risk, safety, strategy, swap, sweep, tx_parse)
@@ -24,6 +24,7 @@ HEARTBEAT_S = 6 * 3600
 MAX_POSITIONS = strategy.RISK["MAX_POSITIONS"]   # единый конфиг (капитал-replay: 5 без потерь)
 SEEN_MAX = 100_000
 MAX_EVENT_AGE_S = 300      # событие старше 5 мин = протухшее (backfill), не торгуем
+SLOT_S = 0.4               # длительность слота Solana — переводит отставание слотов в секунды
 SWEEP_POLL_S = 600         # как часто проверять, не пора ли выводить прибыль
 PRIORITY = set(strategy.ENTRY["PRIORITY_ACTORS"])
 
@@ -104,8 +105,12 @@ async def run(max_mc: float, seconds: int | None) -> None:
     pos_intent: dict[str, str] = {}       # token -> id намерения в леджере
     stats = {"signals": 0, "strong": 0, "quiet": 0, "alerts": 0, "opens": 0, "exits": 0,
              "skipped_unsellable": 0, "skipped_rule": 0, "from_logs": 0, "from_rpc": 0,
+             "stale_slots": 0,
              "started": time.time(), "last_signal_ts": time.time()}
     loop = asyncio.get_event_loop()
+    # Аномалии цены по источнику. Одно число на все пути было бесполезно: у каждого своя
+    # нормальная частота, и общий порог либо молчит на поломке, либо кричит на норме.
+    anom_src: Counter = Counter()
 
     def sane_price(token: str, price: float | None, src: str = "trade") -> float | None:
         """Санитарная проверка цены. Применяется на ВСЕХ путях, кроме трекера,
@@ -129,6 +134,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
         out, anomaly = sanitize_price(price, ref, tracker.SANITY_JUMP)
         if anomaly:
             tracker.anomalies += 1
+            anom_src[src] += 1        # разбивка по источнику: у путей разная нормальная частота
             print(f"[{src}] SKIP аномальная цена {token[:8]}: {price:.3e} "
                   f"(ref {ref:.3e}, {price/ref:.1e}x) → берём ref")
         return out
@@ -288,7 +294,17 @@ async def run(max_mc: float, seconds: int | None) -> None:
             print(f"[RISK] СТОП: {tripped['reason']}")
         pm.close(token)
 
-    async def on_event(wallet: str, sig: str, logs: list | None = None) -> None:
+    async def on_event(wallet: str, sig: str, logs: list | None = None,
+                       slot_lag: int = 0) -> None:
+        # ПРОТУХШЕЕ СОБЫТИЕ, путь «из логов». Разбор из логов не даёт blockTime, монитор
+        # проставляет время ПОЛУЧЕНИЯ — и проверка возраста ниже на этом пути всегда
+        # видела ноль (аудит 10.08). Отставание по слотам — единственный доступный
+        # признак: слот идёт с уведомлением бесплатно, RPC не нужен.
+        if slot_lag * SLOT_S > MAX_EVENT_AGE_S:
+            stats["stale_slots"] += 1
+            print(f"[stale slot] пропуск {sig[:10]}: отставание {slot_lag} слотов "
+                  f"(~{slot_lag * SLOT_S / 60:.0f} мин)")
+            return
         if sig in seen_sigs:
             return
         seen_sigs.add(sig)
@@ -554,7 +570,11 @@ async def run(max_mc: float, seconds: int | None) -> None:
             new_anom = tracker.anomalies - prev_anom
             prev_anom = tracker.anomalies
             if new_anom > strategy.ALERTS["MAX_ANOMALY_RATE"]:
-                problems.append(f"аномалий цены за период: {new_anom} — источник врёт?")
+                # разбивка обязательна: «аномалий 400» ни о чём не говорит, а
+                # «из них 380 на разборе сделки» указывает прямо на парсер логов
+                разбивка = ", ".join(f"{k}={v}" for k, v in anom_src.most_common())
+                problems.append(f"аномалий цены за период: {new_anom} ({разбивка}) — источник врёт?")
+            anom_src.clear()
             silence_h = (time.time() - stats["last_signal_ts"]) / 3600
             if silence_h > strategy.ALERTS["STALE_SIGNAL_H"]:
                 problems.append(f"нет сигналов {silence_h:.1f}ч — поток иссяк / WS молчит?")
@@ -583,7 +603,8 @@ async def run(max_mc: float, seconds: int | None) -> None:
                    f"(strong={stats['strong']} тихих={stats['quiet']} алертов={stats['alerts']}) · "
                    f"входов={stats['opens']} выходов={stats['exits']} · открытых={len(pm.open_tokens())} · "
                    f"трек={len(tracker.active)} · аном={tracker.anomalies} · "
-                   f"непродаваемых={stats['skipped_unsellable']} правилом={stats['skipped_rule']} · "
+                   f"непродаваемых={stats['skipped_unsellable']} правилом={stats['skipped_rule']} "
+                   f"протухших={stats['stale_slots']} · "
                    f"сделок из логов={stats['from_logs']} через RPC={stats['from_rpc']} "
                    f"(бюджет {helius.budget_report()}) · "
                    f"SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}\n"
