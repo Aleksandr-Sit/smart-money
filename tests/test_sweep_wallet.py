@@ -71,19 +71,28 @@ def test_баланс_недоступен_ничего_не_выводим(cfg,
 
 
 def test_ниже_порога_не_выводим(cfg, monkeypatch):
+    """Суммы берём ИЗ КОНФИГА, а не числами (10.08).
+
+    Прежде здесь стояли $400/$430/$435 вкрапленные в код. Когда банк поменяли
+    с 400 на 375 по фактическому остатку кошелька, тесты упали не потому, что
+    сломалась логика вывода, а потому что устарели их константы. Тест обязан
+    проверять правило, а не помнить конкретный банк.
+    """
     monkeypatch.setattr(sweep.market, "sol_price", lambda: 100.0)
-    p = sweep.plan(balance_sol=4.0)          # $400 = банк, порог $500
+    порог = cfg["SWEEP_TRIGGER_USD"]
+    p = sweep.plan(balance_sol=(порог - 1) / 100.0)      # доллар не дотягивает до порога
     assert p["action"] == "skip" and "порога" in p["reason"]
 
 
 def test_излишек_меньше_шага_не_выводим(cfg, monkeypatch):
-    """Порог и шаг согласованы: банк $400 + буфер $5 + шаг $25 → порог $430."""
+    """Порог и шаг согласованы: банк + шаг вывода = порог."""
     monkeypatch.setattr(sweep.market, "sol_price", lambda: 100.0)
-    assert sweep.plan(balance_sol=4.35)["action"] == "sweep"      # $435: излишек $30 >= $25
-    p2 = sweep.plan(balance_sol=4.31)                              # $431: излишек $26... 
-    assert p2["action"] in ("sweep", "skip")                       # граница
-    p3 = sweep.plan(balance_sol=4.25)                              # $425 — ниже порога $430
-    assert p3["action"] == "skip"
+    порог, шаг = cfg["SWEEP_TRIGGER_USD"], cfg["SWEEP_MIN_USD"]
+    банк = strategy.RISK["BANKROLL_USD"]
+    # излишка над банком хватает на шаг → выводим
+    assert sweep.plan(balance_sol=(банк + шаг + 5) / 100.0)["action"] == "sweep"
+    # ниже порога — не выводим, каким бы ни был излишек
+    assert sweep.plan(balance_sol=(порог - 5) / 100.0)["action"] == "skip"
 
 
 def test_буфер_комиссий_не_выводится(cfg, monkeypatch):

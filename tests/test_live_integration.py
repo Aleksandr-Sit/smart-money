@@ -74,8 +74,38 @@ def test_полный_выход_продаёт_весь_остаток_коше
     assert доля_для_свопа == 1.0
 
 
-def test_живой_режим_выключен_в_боевом_конфиге():
-    """Предохранитель: конфиг в репозитории не должен торговать по-настоящему."""
-    assert strategy.EXECUTION["LIVE_ENABLED"] is False
-    assert strategy.RISK["RISK_MODE"] == "shadow"
+def test_инварианты_боевого_конфига_при_живых_деньгах():
+    """Живой режим включён владельцем 10.08. Тест больше не запрещает торговлю —
+    он держит условия, без которых торговать нельзя.
+
+    Прежняя версия просто требовала LIVE_ENABLED=False. Такой предохранитель
+    защищал ровно до того дня, когда флаг понадобилось включить, и дальше его
+    пришлось бы удалить целиком, потеряв и остальные проверки. Поэтому здесь
+    сформулированы инварианты, а не запрет.
+    """
+    live = strategy.EXECUTION["LIVE_ENABLED"]
+    if not live:
+        assert strategy.RISK["RISK_MODE"] == "shadow"
+        return
+
+    # 1. Денежные лимиты обязаны РЕЗАТЬ, а не логироваться: в shadow дневной стоп
+    #    не остановил бы слив.
+    assert strategy.RISK["RISK_MODE"] == "enforce"
+
+    # 2. Читать и отправлять через один публичный узел нельзя: его падение
+    #    одновременно ослепит бота и лишит возможности закрыть позиции.
+    assert not (strategy.EXECUTION["SEND_PROVIDER"] == strategy.TRACKING["RPC_PROVIDER"]
+                == "public")
+
+    # 3. Банк должен быть похож на реальные деньги: дневной стоп считается от него,
+    #    и завышенный банк делает стоп недостижимым.
+    клипов = strategy.RISK["BANKROLL_USD"] / strategy.RISK["CLIP_USD"]
+    assert клипов >= 15, "risk-of-ruin: меньше 15 клипов = разорение до прихода хвоста"
+    assert strategy.RISK["MAX_POSITIONS"] * strategy.RISK["CLIP_USD"] <= \
+        strategy.RISK["BANKROLL_USD"]
+
+    # 4. Один своп не должен уносить заметную долю банка даже при ошибке вызова.
+    assert strategy.EXECUTION["MAX_SWAP_USD"] <= strategy.RISK["BANKROLL_USD"] / 2
+
+    # 5. Вывод на холодный кошелёк включается ОТДЕЛЬНЫМ решением, не вместе с торговлей.
     assert strategy.SWEEP["ENABLED"] is False
