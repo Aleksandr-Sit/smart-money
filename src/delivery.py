@@ -149,7 +149,11 @@ def deliver_exit(pos, exit_price: float, reason: str, telegram: bool = True) -> 
     # итоговый GROSS PnL с учётом ЧАСТИЧНЫХ тейков (реализованное + остаток по цене выхода)
     realized = total_realized(pos, exit_price)
     realized_net = realized - EXIT_FEE          # round-trip swap+priority ~6% (хайркат — не логируем)
+    # mode ОБЯЗАТЕЛЕН (10.08): без него живые и бумажные выходы в одном файле
+    # неразличимы, и первая же неделя живой торговли испортит всю накопленную
+    # статистику — разделить постфактум будет нечем.
     rec = {"ts": now, "type": "exit", "strategy_version": strategy.VERSION,
+           "mode": "live" if strategy.EXECUTION["LIVE_ENABLED"] else "paper",
            "token_mint": pos.token_mint, "reason": reason,
            "entry_price": pos.entry_price, "exit_price": exit_price, "realized_pnl": realized,
            "realized_net": realized_net, "realized_partial": pos.realized, "remaining": pos.remaining,
@@ -188,6 +192,23 @@ def log_actor_buy(actor: str, wallet: str, token: str, usd: float, ts: float,
     _append(config.OUTPUT_DIR / "actor_buys.jsonl",
             {"ts": ts, "actor": actor, "wallet": wallet, "token_mint": token,
              "usd": round(usd, 2), "converged": converged, "n_actors": n_actors})
+
+
+def log_actor_sell_any(token: str, actor: str, price: float | None, ts) -> None:
+    """Продажа актора по ОТСЛЕЖИВАЕМОМУ токену, в котором у нас позиции НЕТ.
+
+    ЗАЧЕМ (10.08, вопрос владельца о работе не в полную силу). Когда бот держит меньше
+    позиций, чем приходит сигналов, невзятые сигналы всё равно логируются, и трекер
+    ведёт их цену — исход можно восстановить симуляцией. Но выход по продаже актора
+    закрывает 86% позиций, а log_actor_sell пишет только при ОТКРЫТОЙ позиции. Без
+    этого журнала у невзятых сигналов не было бы главного правила выхода, и
+    восстановление опиралось бы на одни ценовые правила, решающие меньшинство случаев.
+
+    Отдельный файл, а не общий: здесь нет цены входа и состава акторов позиции —
+    их надо доставать из signals.log по токену.
+    """
+    _append(config.OUTPUT_DIR / "actor_sells_all.jsonl",
+            {"ts": ts, "token_mint": token, "actor": actor, "sell_price": price})
 
 
 def log_actor_sell(token: str, actor: str, price: float | None, ts, pos) -> None:

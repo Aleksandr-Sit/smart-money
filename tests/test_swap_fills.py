@@ -25,16 +25,22 @@ def test_покупка_считает_дельту_а_не_весь_балан�
 
 def test_ожидание_расчёта_баланса_переживает_отставание_узла(monkeypatch):
     """Подтверждение и чтение баланса приходят с разных слотов: нельзя читать сразу."""
-    seq = iter([(1000.0, "ata"), (1000.0, "ata"), (1500.0, "ata")])
-    monkeypatch.setattr(swap, "token_balance", lambda m: next(seq))
+    seq = iter([(1_000_000_000, 6, "ata")] * 4 + [(1_500_000_000, 6, "ata")])
+    monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: next(seq))
     monkeypatch.setattr(swap.time, "sleep", lambda s: None)
+    monkeypatch.setattr(swap.helius, "send_url", lambda: "https://send")
     assert swap._settled_token_balance("mint", 1000.0) == 1500.0
 
 
 def test_ожидание_сдаётся_и_не_виснет(monkeypatch):
-    """Если баланс так и не сдвинулся, возвращаем что есть, а не крутимся вечно."""
-    monkeypatch.setattr(swap, "token_balance", lambda m: (1000.0, "ata"))
+    """Если баланс так и не сдвинулся, возвращаем ПРОЧИТАННОЕ значение, а не None.
+
+    Разница принципиальна (10.08): прочитали и увидели прежний баланс — это факт
+    «сделка не изменила баланс»; не смогли прочитать вовсе — это None, «не знаем».
+    """
+    monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: (1_000_000_000, 6, "ata"))
     monkeypatch.setattr(swap.time, "sleep", lambda s: None)
+    monkeypatch.setattr(swap.helius, "send_url", lambda: "https://send")
     assert swap._settled_token_balance("mint", 1000.0, tries=3) == 1000.0
 
 

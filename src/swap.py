@@ -37,20 +37,34 @@ def _cfg() -> dict:
     return strategy.EXECUTION
 
 
-def _settled_token_balance(mint: str, before: float, tries: int = 6) -> float:
+def _settled_token_balance(mint: str, before: float | None, tries: int = 12,
+                           pause: float = 2.5) -> float | None:
     """Дождаться, пока баланс токена изменится после подтверждённой сделки.
 
-    Подтверждение транзакции и чтение баланса могут прийти с разных слотов, а на
-    публичном узле — и с разных нод. Прочитав сразу, легко получить состояние ДО
-    сделки и записать в леджер мусорное проскальзывание. Ждём фактического сдвига.
+    → баланс, либо None если прочитать так и не удалось. None и 0 — РАЗНЫЕ ответы:
+    «не знаем» против «пусто». Их смешение и стоило нам первой живой сделки (10.08):
+    публичный узел не отдал баланс, код принял это за «токенов не прибавилось» и
+    объявил покупку неудачной, хотя 10 USDC уже лежали в кошельке.
+
+    Спрашиваем ПООЧЕРЁДНО узел чтения и узел ОТПРАВКИ: второй транзакцию видел
+    заведомо, потому что сам её принял, а узел чтения может отставать на слоты.
+    Окно ожидания 30с против прежних 9с — подтверждение приходит раньше, чем
+    состояние расходится по нодам.
     """
-    last = before
-    for _ in range(tries):
-        bal, _ = token_balance(mint)
-        if abs(bal - before) > 1e-12:
-            return bal
-        last = bal
-        time.sleep(1.5)
+    if before is None:
+        before = 0.0
+    last = None
+    for i in range(tries):
+        for url in (None, helius.send_url()):
+            try:
+                raw, dec, _ = token_balance_raw(mint, url=url)
+            except Exception:  # noqa: BLE001
+                continue                      # узел не ответил — это НЕ «баланс нулевой»
+            bal = raw / (10 ** dec) if dec else float(raw)
+            last = bal
+            if abs(bal - before) > 1e-12:
+                return bal
+        time.sleep(pause)
     return last
 
 
@@ -69,14 +83,14 @@ def _settled_sol_balance(before: float | None, tries: int = 6) -> float | None:
 
 
 def token_balance(mint: str) -> tuple[float, str | None]:
-    """(количество токенов, адрес ATA). (0, None) если аккаунта нет."""
+    """(количество токенов, адрес ATA). (0, None) если аккаунта нет. Бросает при сбое узла."""
     raw, _dec, ata = token_balance_raw(mint)
     if ata is None:
         return 0.0, None
     return raw / (10 ** _dec), ata
 
 
-def token_balance_raw(mint: str) -> tuple[int, int, str | None]:
+def token_balance_raw(mint: str, url: str | None = None) -> tuple[int, int, str | None]:
     """(целое количество в минимальных единицах, decimals, ATA). (0, 0, None) — аккаунта нет.
 
     ЦЕЛОЕ, А НЕ uiAmount (аудит 10.08). Прежде продажа считалась как
@@ -86,20 +100,21 @@ def token_balance_raw(mint: str) -> tuple[int, int, str | None]:
     баланс, а он не даёт закрыть токен-аккаунт и вернуть ренту ~0.002 SOL.
     Масштаб честно: ~3 незакрытых аккаунта из 230 сделок в сутки, около $0.45/сут.
     Правка дешёвая, поэтому сделана, но крупной экономией она не является.
+
+    СБОЙ УЗЛА БРОСАЕТ ИСКЛЮЧЕНИЕ, а не возвращает ноль (найдено пробной сделкой 10.08):
+    прежде любая ошибка RPC превращалась в «аккаунта нет», и покупка, реально прошедшая
+    на цепи, выглядела как неудачная. Тихий ноль на денежном пути недопустим.
     """
     w = wallet.Wallet()
     if not w.available:
         return 0, 0, None
-    try:
-        r = helius.rpc("getTokenAccountsByOwner",
-                       [w.address, {"mint": mint}, {"encoding": "jsonParsed"}])
-        accs = (r.get("result") or {}).get("value") or []
-        if not accs:
-            return 0, 0, None
-        amount = accs[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]
-        return int(amount["amount"]), int(amount["decimals"]), accs[0]["pubkey"]
-    except Exception:  # noqa: BLE001
+    r = helius.rpc("getTokenAccountsByOwner",
+                   [w.address, {"mint": mint}, {"encoding": "jsonParsed"}], url=url)
+    accs = (r.get("result") or {}).get("value") or []
+    if not accs:
         return 0, 0, None
+    amount = accs[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]
+    return int(amount["amount"]), int(amount["decimals"]), accs[0]["pubkey"]
 
 
 def sell_amount_raw(raw_balance: int, fraction: float) -> int:
@@ -207,8 +222,14 @@ def buy(mint: str, usd: float | None = None) -> dict:
     tokens_expected = int(q["outAmount"])
     quoted_price = usd / tokens_expected if tokens_expected else None
     # баланс ДО сделки: считать цену по итоговому балансу нельзя — при повторном входе
-    # или после частичной продажи там лежат старые токены, и цена выйдет заниженной
-    bal_before, _ = token_balance(mint)
+    # или после частичной продажи там лежат старые токены, и цена выйдет заниженной.
+    # Не прочитали — не повод отказываться от сделки: потеряем только замер проскальзывания.
+    try:
+        bal_before, _ = token_balance(mint)
+    except Exception as e:  # noqa: BLE001
+        print(f"[swap] баланс до покупки не прочитан ({type(e).__name__}) — "
+              f"сделка идёт, проскальзывание не измерим")
+        bal_before = None
 
     iid = ledger.record_intent("buy", mint, quoted_price, clip_usd=usd,
                                reason="signal", mode="live" if _live() else "dry",
@@ -222,13 +243,25 @@ def buy(mint: str, usd: float | None = None) -> dict:
     sig = _sign_and_send(swap)
     ok = confirm(sig)
     bal_after = _settled_token_balance(mint, bal_before)
-    got = bal_after - bal_before           # КУПЛЕНО, а не всего на аккаунте
-    actual_price = (usd / got) if got > 0 else None
+    # None = баланс прочитать не удалось. Это НЕ ноль: подтверждённая транзакция уже
+    # в блоке, токены наши, и отказываться от позиции из-за молчания узла нельзя —
+    # именно так родилась первая живая сирота (10.08).
+    known = bal_after is not None and bal_before is not None
+    got = (bal_after - bal_before) if known else None
+    actual_price = (usd / got) if (got and got > 0) else None
     slip = (actual_price / quoted_price - 1) if (actual_price and quoted_price) else None
     ledger.record_fill(iid, mint, actual_price, usd=usd, tokens=got, signature=sig,
                        mode="live", extra={"confirmed": ok, "slippage_vs_quote": slip,
                                            "balance_before": bal_before, "balance_after": bal_after})
-    if got > 0:
+    if ok and got is None:
+        # подтверждено, но количество неизвестно: позицию открываем (выход продаёт
+        # ВЕСЬ остаток, точное число для управления сделкой не нужно), замер теряем
+        print(f"[swap] покупка {mint[:12]} подтверждена, баланс не прочитан — "
+              f"позиция открывается, проскальзывание не измерено")
+        return {"action": "bought", "signature": sig, "tokens": None, "confirmed": True,
+                "quoted_price": quoted_price, "actual_price": None,
+                "slippage_vs_quote": None, "balance_unknown": True, "intent": iid}
+    if got and got > 0:
         # ФАКТ БАЛАНСА ВАЖНЕЕ ВЕРДИКТА ПОДТВЕРЖДЕНИЯ (аудит 10.08). Токены на счету —
         # значит покупка состоялась, даже если confirm() не дождался статуса за таймаут.
         # Прежний код в этом случае бросал исключение, монитор откатывал слот, и токены
@@ -254,8 +287,14 @@ def sell(mint: str, fraction: float = 1.0, reason: str = "exit") -> dict:
     if not (0 < fraction <= 1.0):
         raise SwapError(f"доля {fraction} вне (0, 1]")
 
-    # ОДИН запрос вместо двух: раньше баланс и decimals читались отдельными вызовами
-    raw_bal, dec, ata = token_balance_raw(mint)
+    # ОДИН запрос вместо двух: раньше баланс и decimals читались отдельными вызовами.
+    # Узел не ответил → НЕ продаём: продажа вслепую хуже пропущенного выхода, а
+    # «ноль» от сбоя связи неотличим от пустого аккаунта (пробная сделка 10.08).
+    try:
+        raw_bal, dec, ata = token_balance_raw(mint)
+    except Exception as e:  # noqa: BLE001
+        raise SwapError(f"баланс {mint[:12]} не прочитан ({type(e).__name__}) — "
+                        f"продажу не начинаем, токен остаётся у нас") from None
     if raw_bal <= 0:
         return {"action": "skip", "reason": "нечего продавать (нулевой баланс)"}
     raw = sell_amount_raw(raw_bal, fraction)
@@ -296,7 +335,12 @@ def sell(mint: str, fraction: float = 1.0, reason: str = "exit") -> dict:
                               "slippage_vs_quote": slip})
     closed = None
     if ok and fraction >= 1.0:
-        closed = close_token_account(mint)     # вернуть ренту ~$0.15
+        # рента ~$0.15 приятна, но продажа уже состоялась — сбой на закрытии аккаунта
+        # НЕ должен выглядеть как сорванная продажа. Аккаунт подберёт разбор сирот.
+        try:
+            closed = close_token_account(mint)
+        except Exception as e:  # noqa: BLE001
+            closed = {"action": "fail", "reason": f"{type(e).__name__}: {str(e)[:100]}"}
     if not ok:
         raise SwapError(f"продажа НЕ подтвердилась за таймаут, tx {sig} — проверить кошелёк")
     return {"action": "sold", "signature": sig, "sol_out": sol_out,

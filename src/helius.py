@@ -99,12 +99,28 @@ def ws_url() -> str:
 _SEND_METHODS = {"sendTransaction"}
 
 
-def rpc(method: str, params: list, timeout: int = 20) -> dict:
-    url = send_url() if method in _SEND_METHODS else rpc_url()
-    r = requests.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+def rpc(method: str, params: list, timeout: int = 20, url: str | None = None) -> dict:
+    """JSON-RPC вызов. ОШИБКА УЗЛА = ИСКЛЮЧЕНИЕ, а не пустой результат.
+
+    Найдено пробной живой сделкой 10.08. Раньше при ответе вида {"error": {...}}
+    (например, 429 от публичного узла) метод возвращал словарь без ключа "result",
+    а вызывающий делал .get("result") и получал None. Для getTokenAccountsByOwner
+    это неотличимо от «аккаунта нет» — то есть сбой сети выглядел как «токенов ноль».
+    Именно так покупка на $10 прошла на цепи, а код решил, что баланс не вырос.
+    Все вызывающие уже обёрнуты в try/except, поэтому громкий отказ безопаснее тихой лжи.
+
+    url — прочитать с КОНКРЕТНОГО узла (нужно, когда узел чтения отстаёт от узла,
+    на который мы только что отправили транзакцию).
+    """
+    dest = url or (send_url() if method in _SEND_METHODS else rpc_url())
+    r = requests.post(dest, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
                       timeout=timeout)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    if isinstance(data, dict) and data.get("error") is not None:
+        err = data["error"]
+        raise RuntimeError(f"RPC {method}: {str(err)[:200]}")
+    return data
 
 
 def check() -> None:
