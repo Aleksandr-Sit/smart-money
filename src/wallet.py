@@ -57,12 +57,16 @@ class Wallet:
     def address(self) -> str:
         return str(self.pubkey)
 
-    def balance_sol(self) -> float | None:
-        """Баланс в SOL через RPC. None при сбое связи (вызывающий обязан считать это отказом)."""
+    def balance_sol(self, url: str | None = None) -> float | None:
+        """Баланс в SOL через RPC. None при сбое связи (вызывающий обязан считать это отказом).
+
+        url — спросить КОНКРЕТНЫЙ узел. Нужно после отправки транзакции: узел чтения
+        отстаёт на слоты, а узел отправки её видел заведомо (пробная сделка 10.08).
+        """
         if not self._kp:
             return None
         try:
-            r = helius.rpc("getBalance", [self.address])
+            r = helius.rpc("getBalance", [self.address], url=url)
             v = (r.get("result") or {}).get("value")
             return (v / _LAMPORTS) if v is not None else None
         except Exception:  # noqa: BLE001

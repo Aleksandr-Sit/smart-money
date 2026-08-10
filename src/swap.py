@@ -68,17 +68,27 @@ def _settled_token_balance(mint: str, before: float | None, tries: int = 12,
     return last
 
 
-def _settled_sol_balance(before: float | None, tries: int = 6) -> float | None:
-    """То же для SOL: ждём, пока баланс сдвинется после продажи."""
+def _settled_sol_balance(before: float | None, tries: int = 12,
+                         pause: float = 2.5) -> float | None:
+    """То же для SOL: ждём, пока баланс сдвинется после продажи.
+
+    Первая живая продажа (10.08) вернула sol_actual = 0.0 именно здесь: узел чтения
+    девять секунд отдавал баланс ДО сделки, код сдался и записал нулевую выручку,
+    из-за чего проскальзывание опять не измерилось. Спрашиваем оба узла и ждём 30с.
+    """
     if before is None:
         return None
-    last = before
+    w = wallet.Wallet()
+    last = None
     for _ in range(tries):
-        bal = wallet.Wallet().balance_sol()
-        if bal is not None and abs(bal - before) > 1e-9:
-            return bal
-        last = bal if bal is not None else last
-        time.sleep(1.5)
+        for url in (None, helius.send_url()):
+            bal = w.balance_sol(url=url)
+            if bal is None:
+                continue
+            last = bal
+            if abs(bal - before) > 1e-9:
+                return bal
+        time.sleep(pause)
     return last
 
 
@@ -351,8 +361,25 @@ def close_token_account(mint: str) -> dict:
     """Закрыть пустой токен-аккаунт и вернуть ренту (~0.002 SOL ≈ $0.15)."""
     w = wallet.Wallet()
     # ЦЕЛОЕ количество: остаток в несколько минимальных единиц во float читается как 0.0,
-    # мы бы решили, что аккаунт пуст, и отправили заведомо провальную транзакцию закрытия
-    raw_bal, _dec, ata = token_balance_raw(mint)
+    # мы бы решили, что аккаунт пуст, и отправили заведомо провальную транзакцию закрытия.
+    # ЖДЁМ ОБНУЛЕНИЯ, а не читаем один раз (10.08): закрытие идёт сразу после продажи, и
+    # узел чтения ещё отдаёт баланс ДО неё. Первая живая продажа из-за этого не вернула
+    # ренту 0.002039 SOL — аккаунт остался открытым с нулём внутри.
+    raw_bal, ata, прочитано = None, None, False
+    for _ in range(8):
+        for url in (helius.send_url(), None):      # сначала узел, принявший продажу
+            try:
+                raw_bal, _dec, ata = token_balance_raw(mint, url=url)
+            except Exception:  # noqa: BLE001
+                continue                            # молчание узла — НЕ «аккаунта нет»
+            прочитано = True
+            if ata is None or raw_bal == 0:
+                break
+        if прочитано and (ata is None or raw_bal == 0):
+            break
+        time.sleep(2.0)
+    if not прочитано:
+        return {"action": "skip", "reason": "баланс не прочитан — закрывать вслепую нельзя"}
     if ata is None:
         return {"action": "skip", "reason": "аккаунта нет"}
     if raw_bal > 0:

@@ -150,6 +150,49 @@ def test_в_записи_выхода_есть_режим(monkeypatch, tmp_path)
     assert all(r["mode"] == "paper" for r in written)
 
 
+def test_выручка_SOL_ждёт_расхождения_узлов(monkeypatch):
+    """Первая живая продажа записала sol_actual = 0.0: узел чтения девять секунд
+    отдавал баланс ДО сделки, код сдался и решил, что выручки не было."""
+    seq = iter([2.0, 2.0, 2.0, 2.13])
+
+    class W:
+        def balance_sol(self, url=None):
+            return next(seq, 2.13)
+
+    monkeypatch.setattr(swap.wallet, "Wallet", lambda: W())
+    monkeypatch.setattr(swap.time, "sleep", lambda s: None)
+    monkeypatch.setattr(swap.helius, "send_url", lambda: "https://send")
+    assert swap._settled_sol_balance(2.0, tries=6) == pytest.approx(2.13)
+
+
+def test_закрытие_аккаунта_ждёт_обнуления(monkeypatch):
+    """Закрытие идёт сразу после продажи, узел ещё отдаёт баланс ДО неё.
+
+    Первая живая продажа из-за этого не вернула ренту 0.002039 SOL:
+    аккаунт остался открытым с нулём внутри.
+    """
+    seq = iter([(10_004_341, 6, "ata"), (10_004_341, 6, "ata"), (0, 6, "ata")])
+    monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: next(seq, (0, 6, "ata")))
+    monkeypatch.setattr(swap.time, "sleep", lambda s: None)
+    monkeypatch.setattr(swap.helius, "send_url", lambda: "https://send")
+    monkeypatch.setattr(swap.wallet, "Wallet",
+                        lambda: type("W", (), {"available": True, "address": "a"})())
+    monkeypatch.setitem(swap.strategy.EXECUTION, "LIVE_ENABLED", False)
+    r = swap.close_token_account("MINT")
+    assert r["action"] == "dry_run", "дождались нуля и дошли до закрытия"
+
+
+def test_закрытие_не_идёт_вслепую_при_молчащих_узлах(monkeypatch):
+    monkeypatch.setattr(swap, "token_balance_raw",
+                        lambda m, url=None: (_ for _ in ()).throw(RuntimeError("429")))
+    monkeypatch.setattr(swap.time, "sleep", lambda s: None)
+    monkeypatch.setattr(swap.helius, "send_url", lambda: "https://send")
+    monkeypatch.setattr(swap.wallet, "Wallet",
+                        lambda: type("W", (), {"available": True, "address": "a"})())
+    r = swap.close_token_account("MINT")
+    assert r["action"] == "skip" and "не прочитан" in r["reason"]
+
+
 def test_продажи_акторов_пишутся_и_без_позиции(monkeypatch):
     """86% выходов — actor-exit. Для НЕВЗЯТЫХ сигналов это единственный след,
     по которому потом можно восстановить, чем сделка бы кончилась."""

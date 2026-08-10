@@ -60,7 +60,7 @@ def test_доля_продажи_валидируется(monkeypatch):
 
 def test_нулевой_баланс_не_продаём(monkeypatch):
     monkeypatch.setattr(swap.wallet.Wallet, "available", property(lambda self: True))
-    monkeypatch.setattr(swap, "token_balance_raw", lambda m: (0, 0, None))
+    monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: (0, 0, None))
     assert swap.sell("Mint" + "x" * 40)["action"] == "skip"
 
 
@@ -72,7 +72,8 @@ def test_неподтверждённая_транзакция_это_неуда
 
 def test_закрытие_аккаунта_только_при_нулевом_балансе(monkeypatch):
     """Закрывать аккаунт с токенами = потерять их."""
-    monkeypatch.setattr(swap, "token_balance_raw", lambda m: (5_000_000, 6, "ATA" + "x" * 40))
+    monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: (5_000_000, 6, "ATA" + "x" * 40))
+    monkeypatch.setattr(swap.time, "sleep", lambda s: None)   # ожидание обнуления не нужно
     r = swap.close_token_account("Mint" + "x" * 40)
     assert r["action"] == "skip" and "единиц" in r["reason"]
 
