@@ -11,10 +11,19 @@ import pytest
 
 from src import merge_watchlist as mw
 
+# настоящая функция, захваченная ДО автоподмены в фикстуре no_buy_journal
+_настоящий_buy_activity = mw.buy_activity
+
 
 def _a(aid, wallets, **kw):
     return {"actor_id": aid, "wallets": list(wallets), "n_wallets": len(wallets),
             "weight": kw.pop("weight", 1.0), **kw}
+
+
+@pytest.fixture(autouse=True)
+def no_buy_journal(monkeypatch):
+    """Журнал покупок появился 10.08 — в большинстве тестов он пуст."""
+    monkeypatch.setattr(mw, "buy_activity", lambda: {})
 
 
 @pytest.fixture
@@ -109,6 +118,36 @@ def test_срок_наблюдения_не_обнуляется_записью_
     out, rep = mw.merge([], [_a("молчун", ["w1"], added_ts=time.time() - 60 * day)])
     assert rep["порог_не_достигнут"] is False and rep["выброшено_молчунов"] == 1
     assert out == []
+
+
+def test_покупает_но_не_сходится_это_не_молчун(monkeypatch):
+    """Актор жив и активен, но его покупки не совпадают по времени с чужими.
+
+    Исключать автоматически нельзя: возможно, ушёл его НАПАРНИК, а не он сам.
+    Поэтому категория отдельная и попадает в отчёт человеку, а решение о
+    выбрасывании по-прежнему принимается только по молчанию в сигналах.
+    """
+    monkeypatch.setattr(mw, "_observation_days", lambda: 30.0)
+    monkeypatch.setattr(mw, "_seen_actors", lambda w2a: {"одиночка"})
+    monkeypatch.setattr(mw, "buy_activity",
+                        lambda: {"одиночка": {"buys": 40, "converged": 0, "last_ts": 1.0}})
+    out, rep = mw.merge([], [_a("одиночка", ["w1"])])
+    assert len(out) == 1, "актор остаётся в списке"
+    assert rep["покупают_но_не_сходятся"] == 1
+    assert rep["выброшено_молчунов"] == 0
+
+
+def test_журнал_покупок_считает_по_акторам(monkeypatch):
+    записи = [
+        {"ts": 10.0, "actor": "A", "converged": True},
+        {"ts": 20.0, "actor": "A", "converged": False},
+        {"ts": 30.0, "actor": "B", "converged": False},
+        {"actor": None},                       # битая строка — пропустить, не упасть
+    ]
+    monkeypatch.setattr(mw.analysis, "read_jsonl", lambda *a, **k: записи)
+    st = _настоящий_buy_activity()
+    assert st["A"] == {"buys": 2, "converged": 1, "last_ts": 20.0}
+    assert st["B"]["converged"] == 0
 
 
 def test_новому_актору_проставляется_дата_добавления(monkeypatch):

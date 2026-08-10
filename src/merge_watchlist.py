@@ -66,6 +66,26 @@ def _seen_actors(wallet_to_actor: dict[str, str]) -> set[str]:
     return _scan_signals(wallet_to_actor)[0]
 
 
+def buy_activity() -> dict[str, dict]:
+    """Покупки по акторам из actor_buys.jsonl → {actor: {buys, converged, last_ts}}.
+
+    Журнал появился 10.08, до него одиночные покупки не сохранялись — на старых
+    периодах словарь будет пустым, и это НЕ значит «актор не покупал».
+    Служит отчётом для человека, а не правилом исключения: молчание в сигналах
+    остаётся единственным автоматическим основанием выбросить актора.
+    """
+    out: dict[str, dict] = {}
+    for r in analysis.read_jsonl("actor_buys.jsonl"):
+        a = r.get("actor")
+        if not a:
+            continue
+        st = out.setdefault(a, {"buys": 0, "converged": 0, "last_ts": 0.0})
+        st["buys"] += 1
+        st["converged"] += 1 if r.get("converged") else 0
+        st["last_ts"] = max(st["last_ts"], float(r.get("ts") or 0))
+    return out
+
+
 def _observation_days() -> float:
     """Сколько суток мы вообще наблюдаем. Мало данных → не выбрасываем никого."""
     return _scan_signals({})[1]
@@ -108,6 +128,16 @@ def merge(candidates: list[dict], current: list[dict], min_days: float = 14.0,
             added += 1
 
     out = sorted(merged.values(), key=lambda x: -x.get("weight", 0))
+    # ПОКУПАЕТ, НО НЕ СХОДИТСЯ — отдельная категория, а не молчун. Такой актор жив и
+    # активен, просто его покупки не совпадают по времени с покупками остальных.
+    # Исключать его автоматически нельзя: возможно, ушёл его напарник, а не он сам.
+    try:
+        buys = buy_activity()
+    except Exception:  # noqa: BLE001
+        buys = {}
+    lone = [a["actor_id"] for a in out
+            if buys.get(a["actor_id"], {}).get("buys", 0) > 0
+            and buys[a["actor_id"]]["converged"] == 0]
     report = {
         "наблюдение_суток": round(days, 1),
         "было_акторов": len(current),
@@ -118,6 +148,7 @@ def merge(candidates: list[dict], current: list[dict], min_days: float = 14.0,
         "итого_кошельков": len({w for a in out for w in a["wallets"]}),
         "порог_не_достигнут": seen is None,
         "на_испытательном": sum(1 for a in keep if young(a)),
+        "покупают_но_не_сходятся": len(lone),
     }
     return out, report
 

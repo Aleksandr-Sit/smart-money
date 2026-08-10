@@ -167,6 +167,25 @@ def log_partial(pos, price: float | None, frac: float) -> None:
              "entry_ts": pos.entry_ts})
 
 
+def log_actor_buy(actor: str, wallet: str, token: str, usd: float, ts: float,
+                  converged: bool, n_actors: int) -> None:
+    """Лог КАЖДОЙ покупки watchlist-кошелька — сошлась она в сигнал или нет.
+
+    ЗАЧЕМ (аудит 10.08). До этого активность актора фиксировалась только когда он
+    попадал в СИГНАЛ, то есть сходился с кем-то ещё в окне конфлюенса. Одиночные
+    покупки не сохранялись нигде. Из-за этого испытательный срок нового актора
+    невозможно было закрыть по существу: через 14 дней мы знали бы лишь «сигналов
+    не было» и не отличили бы «перестал торговать» от «торгует, но не сходится с
+    нашими». Первое — повод исключить, второе — повод искать ему напарника или
+    признать, что просело покрытие рынка.
+
+    Поле converged и есть та самая разница: покупка была, сигнала не вышло.
+    """
+    _append(config.OUTPUT_DIR / "actor_buys.jsonl",
+            {"ts": ts, "actor": actor, "wallet": wallet, "token_mint": token,
+             "usd": round(usd, 2), "converged": converged, "n_actors": n_actors})
+
+
 def log_actor_sell(token: str, actor: str, price: float | None, ts, pos) -> None:
     """Лог КАЖДОЙ продажи зашедшего актора по открытой позиции (не только триггерной).
     Открывает оптимизацию exit-правила: бэктест EXIT_ACTOR_FRAC по фактической

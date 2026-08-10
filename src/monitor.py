@@ -350,6 +350,16 @@ async def run(max_mc: float, seconds: int | None) -> None:
         ev = BuyEvent(ts=trade.get("ts") or time.time(), token_mint=token,
                       wallet=wallet, usd=trade["sol"] * sol)
         signal = engine.process(ev)
+        # ЖУРНАЛ ПОКУПОК — до проверки сигнала (аудит 10.08). Пишем синхронно, а не через
+        # executor: это добавление строки в файл, а лишний переход между потоками стоил бы
+        # больше, чем сама запись, и удлинил бы путь до входа.
+        _actor = amap.get(wallet)
+        if _actor:
+            try:
+                delivery.log_actor_buy(_actor[0], wallet, token, ev.usd, ev.ts,
+                                       bool(signal), signal.n_actors if signal else 0)
+            except Exception:  # noqa: BLE001
+                pass          # журнал наблюдений не должен ронять торговлю
         if not signal:
             return
         info = await loop.run_in_executor(None, market.token_info, token)
