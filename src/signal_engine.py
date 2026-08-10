@@ -50,14 +50,34 @@ class Signal:
     actor_first_usd: float = 0.0  # сумма ПЕРВЫХ покупок по актору (без DCA) — для будущей замены метрики
 
 
-def load_actor_map(path: Path | None = None) -> dict[str, tuple[str, float]]:
-    """wallet -> (actor_id, weight) из флоу-watchlist."""
+def load_actor_map(path: Path | None = None, quiet: bool = False) -> dict[str, tuple[str, float]]:
+    """wallet -> (actor_id, weight) из флоу-watchlist.
+
+    ОДИН КОШЕЛЁК У ДВУХ АКТОРОВ (аудит 10.08: один такой случай на 129 кошельков).
+    Раньше побеждал тот, кто оказался позже в файле, — молча и без следа. Это не
+    безобидно: кошелёк-то один, а конфлюенс считает РАЗНЫХ акторов, и от того, кому
+    он достался, зависит, наберётся ли порог. Теперь выбор явный и устойчивый —
+    остаётся актор с большим весом (при равенстве побеждает меньший actor_id), а сам
+    факт печатается: это, скорее всего, ошибка кластеризации, и её надо видеть.
+    """
     p = path or (config.OUTPUT_DIR / "flow_watchlist.json")
     data = json.loads(Path(p).read_text(encoding="utf-8"))
     m: dict[str, tuple[str, float]] = {}
+    collisions: list[str] = []
     for a in data:
+        aid, wt = a["actor_id"], float(a["weight"])
         for w in a["wallets"]:
-            m[w] = (a["actor_id"], float(a["weight"]))
+            prev = m.get(w)
+            if prev is None:
+                m[w] = (aid, wt)
+                continue
+            collisions.append(w)
+            if (wt, prev[0]) > (prev[1], aid):     # больший вес, при равенстве меньший id
+                m[w] = (aid, wt)
+    if collisions and not quiet:
+        print(f"[watchlist] ВНИМАНИЕ: {len(collisions)} кошельков числятся за двумя акторами "
+              f"({', '.join(w[:10] + '…' for w in collisions[:3])}) — оставлен актор с большим "
+              f"весом; похоже на ошибку кластеризации")
     return m
 
 

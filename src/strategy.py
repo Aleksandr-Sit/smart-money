@@ -18,8 +18,14 @@ ROOT = Path(__file__).resolve().parent.parent
 PATH = ROOT / "config" / "strategy.yaml"
 
 _REQUIRED = {
+    # SIGNAL_MAX_MC_USD и SIGNAL_MAX_AGE_S УДАЛЕНЫ 10.08. Гейты по капитализации и возрасту
+    # выброшены из движка ещё аудитом-6 (они не срабатывали никогда — BuyEvent приходит без
+    # token_mc, — а замер показал, что включать их вредно: сигналы с MC>100k дают win 0.57
+    # против 0.42 в среднем). В конфиге они продолжали лежать и выглядеть рабочим ограничением.
+    # Настройка, которая выглядит работающей, но не работает, опаснее её отсутствия.
+    # Реальный потолок капитализации задаётся ключом --max-mc монитора.
     "signal": ["CONFLUENCE_N", "STRONG_CONFLUENCE_N", "CONFLUENCE_WINDOW_S",
-               "SIGNAL_MAX_MC_USD", "SIGNAL_MAX_AGE_S", "SIGNAL_MIN_USD", "QUIET_MAX_USD"],
+               "SIGNAL_MIN_USD", "QUIET_MAX_USD"],
     "entry": ["RULE", "PRIORITY_ACTORS"],
     "exit": ["PARTIAL_TAKES", "TP_MULT", "SL_MULT", "TRAIL", "TRAIL_ARM",
              "DEAD_AGE_H", "MAX_HOLD_S", "EXIT_ACTOR_FRAC"],

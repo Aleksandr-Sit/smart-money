@@ -1,4 +1,4 @@
-"""Тесты движка сигнала, конфига стратегии и разбора бондинг-кривой."""
+﻿"""Тесты движка сигнала, конфига стратегии и разбора бондинг-кривой."""
 import pytest
 import yaml
 
@@ -130,7 +130,6 @@ def test_акторы_в_порядке_первой_покупки():
     amap = {f"w{i}": (f"actor{i}", 1.0) for i in range(4)}
     eng = SignalEngine(amap, {"CONFLUENCE_N": 2, "STRONG_CONFLUENCE_N": 3,
                               "CONFLUENCE_WINDOW_S": 600, "QUIET_MAX_USD": 250,
-                              "SIGNAL_MAX_MC_USD": 10**9, "SIGNAL_MAX_AGE_S": 10**9,
                               "SIGNAL_MIN_USD": 1})
     # заходят в порядке 2 → 0 → 1
     for i, w in enumerate(("w2", "w0", "w1")):
@@ -146,7 +145,6 @@ def test_повторная_покупка_не_меняет_порядок():
     amap = {"wA": ("actorA", 1.0), "wB": ("actorB", 1.0)}
     eng = SignalEngine(amap, {"CONFLUENCE_N": 2, "STRONG_CONFLUENCE_N": 3,
                               "CONFLUENCE_WINDOW_S": 600, "QUIET_MAX_USD": 250,
-                              "SIGNAL_MAX_MC_USD": 10**9, "SIGNAL_MAX_AGE_S": 10**9,
                               "SIGNAL_MIN_USD": 1})
     eng.process(BuyEvent(ts=1000.0, token_mint="TOK", wallet="wA", usd=50.0))
     eng.process(BuyEvent(ts=1001.0, token_mint="TOK", wallet="wA", usd=50.0))   # DCA

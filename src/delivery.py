@@ -103,7 +103,11 @@ def deliver(sig: Signal, safety: dict, info: dict | None = None,
 
 
 _REASON_TXT = {"actors_exit": "акторы вышли", "take_profit": "тейк-профит",
-               "stop_loss": "стоп-лосс", "trailing": "трейлинг от пика", "dead": "токен мёртв"}
+               "stop_loss": "стоп-лосс", "trailing": "трейлинг от пика", "dead": "токен мёртв",
+               # добавлены 10.08: три причины уходили в Telegram как сырые английские
+               # слова, хотя timeout — вторая по частоте причина выхода вообще
+               "timeout": "истекло время удержания", "lost_price": "цена потеряна",
+               "orphan": "подобран без позиции"}
 
 
 def format_exit(pos, exit_price: float, reason: str, realized_pnl: float) -> str:

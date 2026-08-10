@@ -77,9 +77,19 @@ def reconcile(rows: list[dict] | None = None) -> dict:
     unfilled = [i for iid, i in intents.items() if iid not in fills]
     slippages = []
     gross_usd = 0.0
+    crossed = 0
     for iid, i in intents.items():
         for f in fills.get(iid, []):
             gross_usd += f.get("usd") or 0.0
+            # ЧУЖАЯ ПАРА (аудит 10.08): до правки 05.08 исполнение ВЫХОДА подшивалось к
+            # намерению на ПОКУПКУ — одно намерение на обе ноги сделки. Тогда fp/ip это
+            # не проскальзывание, а доходность позиции, и в сверку попадали значения вроде
+            # −92%. Таких пар в журнале 661 из 5331; они историчны и уже не появляются,
+            # но продолжали портить цифру в каждом пульсе. Признак: у исполнения есть
+            # reason (то есть это выход), а намерение — на покупку.
+            if i.get("side") == "buy" and f.get("reason"):
+                crossed += 1
+                continue
             ip, fp = i.get("price"), f.get("price")
             if ip and fp and ip > 0:
                 slippages.append(fp / ip - 1)
@@ -89,6 +99,7 @@ def reconcile(rows: list[dict] | None = None) -> dict:
         "fills": sum(len(v) for v in fills.values()),
         "unfilled": len(unfilled),            # намерения без исполнения (в live = провал tx!)
         "orphan_fills": len(orphan_fills),    # исполнение без намерения = ТРЕВОГА
+        "crossed_legs": crossed,              # исторические пары «выход подшит к покупке»
         "median_slippage": statistics.median(slippages) if slippages else None,
         "worst_slippage": min(slippages) if slippages else None,
         "gross_usd": gross_usd,
@@ -98,10 +109,16 @@ def reconcile(rows: list[dict] | None = None) -> dict:
 
 def summary() -> str:
     r = reconcile()
-    sl = f"{r['median_slippage']:+.2%}" if r["median_slippage"] is not None else "—"
+    # В БУМАЖНОМ РЕЖИМЕ проскальзывание тождественно нулю: цена намерения и цена
+    # исполнения — одно и то же число. Показывать «медиана slippage +0.00%» как
+    # достижение нельзя, это не измерение, а тавтология. Цифра оживёт только в live.
+    sl = (f"{r['median_slippage']:+.2%}" if r["median_slippage"] is not None else "—")
+    live = any(x.get("mode") == "live" for x in load() if x.get("type") == "fill")
+    sl_txt = f"медиана slippage {sl}" if live else "slippage: нет живых сделок"
     flag = "✅" if r["ok"] else "🛑 ЕСТЬ ИСПОЛНЕНИЯ БЕЗ НАМЕРЕНИЙ"
+    extra = f", старых кросс-пар {r['crossed_legs']}" if r["crossed_legs"] else ""
     return (f"{flag} леджер: намерений {r['intents']}, исполнений {r['fills']}, "
-            f"без исполнения {r['unfilled']}, медиана slippage {sl}")
+            f"без исполнения {r['unfilled']}{extra}, {sl_txt}")
 
 
 if __name__ == "__main__":

@@ -70,19 +70,48 @@ def _settled_sol_balance(before: float | None, tries: int = 6) -> float | None:
 
 def token_balance(mint: str) -> tuple[float, str | None]:
     """(количество токенов, адрес ATA). (0, None) если аккаунта нет."""
+    raw, _dec, ata = token_balance_raw(mint)
+    if ata is None:
+        return 0.0, None
+    return raw / (10 ** _dec), ata
+
+
+def token_balance_raw(mint: str) -> tuple[int, int, str | None]:
+    """(целое количество в минимальных единицах, decimals, ATA). (0, 0, None) — аккаунта нет.
+
+    ЦЕЛОЕ, А НЕ uiAmount (аудит 10.08). Прежде продажа считалась как
+    int(uiAmount * fraction * 10**decimals), то есть число проходило через float.
+    Замер перебором на диапазоне 1e12..1e15 минимальных единиц: в 1.24% случаев
+    результат меньше остатка ровно на единицу. Одна оставшаяся единица — уже ненулевой
+    баланс, а он не даёт закрыть токен-аккаунт и вернуть ренту ~0.002 SOL.
+    Масштаб честно: ~3 незакрытых аккаунта из 230 сделок в сутки, около $0.45/сут.
+    Правка дешёвая, поэтому сделана, но крупной экономией она не является.
+    """
     w = wallet.Wallet()
     if not w.available:
-        return 0.0, None
+        return 0, 0, None
     try:
         r = helius.rpc("getTokenAccountsByOwner",
                        [w.address, {"mint": mint}, {"encoding": "jsonParsed"}])
         accs = (r.get("result") or {}).get("value") or []
         if not accs:
-            return 0.0, None
-        info = accs[0]["account"]["data"]["parsed"]["info"]
-        return float(info["tokenAmount"]["uiAmount"] or 0), accs[0]["pubkey"]
+            return 0, 0, None
+        amount = accs[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]
+        return int(amount["amount"]), int(amount["decimals"]), accs[0]["pubkey"]
     except Exception:  # noqa: BLE001
-        return 0.0, None
+        return 0, 0, None
+
+
+def sell_amount_raw(raw_balance: int, fraction: float) -> int:
+    """Сколько минимальных единиц продать. → ВЕСЬ остаток при fraction >= 1.
+
+    Вынесено отдельно и покрыто тестом: именно здесь рождалась пыль, мешавшая
+    закрыть аккаунт. Полная продажа обязана быть точной, без обратного пересчёта
+    через float.
+    """
+    if fraction >= 1.0:
+        return raw_balance
+    return int(raw_balance * fraction)
 
 
 def _quote(input_mint: str, output_mint: str, amount_raw: int) -> dict:
@@ -225,22 +254,22 @@ def sell(mint: str, fraction: float = 1.0, reason: str = "exit") -> dict:
     if not (0 < fraction <= 1.0):
         raise SwapError(f"доля {fraction} вне (0, 1]")
 
-    bal, ata = token_balance(mint)
-    if bal <= 0:
+    # ОДИН запрос вместо двух: раньше баланс и decimals читались отдельными вызовами
+    raw_bal, dec, ata = token_balance_raw(mint)
+    if raw_bal <= 0:
         return {"action": "skip", "reason": "нечего продавать (нулевой баланс)"}
-
-    r = helius.rpc("getTokenAccountsByOwner",
-                   [w.address, {"mint": mint}, {"encoding": "jsonParsed"}])
-    dec = int(((r.get("result") or {}).get("value") or [{}])[0]["account"]["data"]
-              ["parsed"]["info"]["tokenAmount"]["decimals"])
-    raw = int(bal * fraction * (10 ** dec))
+    raw = sell_amount_raw(raw_bal, fraction)
     if raw <= 0:
         return {"action": "skip", "reason": "сумма после округления = 0"}
 
     q = _quote(mint, WSOL, raw)
     sol_out = int(q["outAmount"]) / _LAMPORTS
     sol_usd = market.sol_price()
-    quoted_price = (sol_out * sol_usd) / (bal * fraction)
+    # цену считаем по ТОМУ ЖЕ количеству, что уходит в котировку, а не по bal*fraction:
+    # при полной продаже это ровно весь остаток, и расхождения между «сколько продаём»
+    # и «по чему считаем цену» быть не должно
+    tokens_sold = raw / (10 ** dec)
+    quoted_price = (sol_out * sol_usd) / tokens_sold
 
     iid = ledger.record_intent("sell", mint, quoted_price, clip_usd=sol_out * sol_usd,
                                reason=reason, mode="live" if _live() else "dry",
@@ -257,7 +286,6 @@ def sell(mint: str, fraction: float = 1.0, reason: str = "exit") -> dict:
     # проскальзывание по продажам было тождественно нулю — ради его замера всё и строилось
     sol_after = _settled_sol_balance(sol_before)
     sol_got = (sol_after - sol_before) if (sol_after is not None and sol_before is not None) else None
-    tokens_sold = bal * fraction
     actual_price = (sol_got * sol_usd / tokens_sold) if (sol_got and tokens_sold) else None
     slip = (actual_price / quoted_price - 1) if (actual_price and quoted_price) else None
     ledger.record_fill(iid, mint, actual_price or quoted_price,
@@ -278,11 +306,13 @@ def sell(mint: str, fraction: float = 1.0, reason: str = "exit") -> dict:
 def close_token_account(mint: str) -> dict:
     """Закрыть пустой токен-аккаунт и вернуть ренту (~0.002 SOL ≈ $0.15)."""
     w = wallet.Wallet()
-    bal, ata = token_balance(mint)
+    # ЦЕЛОЕ количество: остаток в несколько минимальных единиц во float читается как 0.0,
+    # мы бы решили, что аккаунт пуст, и отправили заведомо провальную транзакцию закрытия
+    raw_bal, _dec, ata = token_balance_raw(mint)
     if ata is None:
         return {"action": "skip", "reason": "аккаунта нет"}
-    if bal > 0:
-        return {"action": "skip", "reason": f"на аккаунте ещё {bal} токенов"}
+    if raw_bal > 0:
+        return {"action": "skip", "reason": f"на аккаунте ещё {raw_bal} минимальных единиц"}
     if not _live():
         return {"action": "dry_run", "ata": ata}
     try:

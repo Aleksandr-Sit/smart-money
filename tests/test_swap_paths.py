@@ -1,4 +1,4 @@
-"""Пути исполнения swap.py — код, который тратит настоящие деньги.
+﻿"""Пути исполнения swap.py — код, который тратит настоящие деньги.
 
 Аудит 08.08: покрытие было 40%, непокрытыми оставались именно ветки сборки,
 отправки и подтверждения. Тесты на моках НЕ заменяют пробную живую сделку —
@@ -52,7 +52,7 @@ def test_доля_продажи_вне_диапазона(monkeypatch):
 
 def test_нечего_продавать_при_нулевом_балансе(monkeypatch):
     monkeypatch.setattr(swap.wallet, "Wallet", _W)
-    monkeypatch.setattr(swap, "token_balance", lambda m: (0.0, None))
+    monkeypatch.setattr(swap, "token_balance_raw", lambda m: (0, 0, None))
     assert swap.sell("MINT")["action"] == "skip"
 
 
@@ -191,7 +191,7 @@ def test_покупка_в_dry_run_только_план(monkeypatch):
 def test_продажа_в_dry_run_только_план(monkeypatch):
     monkeypatch.setattr(swap.wallet, "Wallet", _W)
     monkeypatch.setattr(swap.market, "sol_price", lambda: 70.0)
-    monkeypatch.setattr(swap, "token_balance", lambda m: (1000.0, "ata"))
+    monkeypatch.setattr(swap, "token_balance_raw", lambda m: (1_000_000_000, 6, "ata"))
     monkeypatch.setattr(swap.helius, "rpc", lambda *a, **k: {
         "result": {"value": [{"account": {"data": {"parsed": {"info": {
             "tokenAmount": {"decimals": 6, "uiAmount": 1000.0}}}}}}]}})
@@ -206,12 +206,12 @@ def test_продажа_в_dry_run_только_план(monkeypatch):
 def test_закрытие_аккаунта_с_остатком_запрещено(monkeypatch):
     """Закрыть аккаунт с токенами = потерять их. Проверка обязана быть до отправки."""
     monkeypatch.setattr(swap.wallet, "Wallet", _W)
-    monkeypatch.setattr(swap, "token_balance", lambda m: (5.0, "ata"))
+    monkeypatch.setattr(swap, "token_balance_raw", lambda m: (5_000_000, 6, "ata"))
     r = swap.close_token_account("MINT")
-    assert r["action"] == "skip" and "токенов" in r["reason"]
+    assert r["action"] == "skip" and "минимальных единиц" in r["reason"]
 
 
 def test_закрытие_несуществующего_аккаунта(monkeypatch):
     monkeypatch.setattr(swap.wallet, "Wallet", _W)
-    monkeypatch.setattr(swap, "token_balance", lambda m: (0.0, None))
+    monkeypatch.setattr(swap, "token_balance_raw", lambda m: (0, 0, None))
     assert swap.close_token_account("MINT")["action"] == "skip"
