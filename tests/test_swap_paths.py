@@ -179,7 +179,7 @@ def test_покупка_в_dry_run_только_план(monkeypatch):
     monkeypatch.setattr(swap.market, "sol_price", lambda: 70.0)
     monkeypatch.setattr(execution, "quote", lambda *a, **k: {"outAmount": "1000000",
                                                                   "priceImpactPct": "0.01"})
-    monkeypatch.setattr(swap, "token_balance", lambda m: (0.0, None))
+    monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: (0, 6, None))
     monkeypatch.setattr(swap.ledger, "record_intent", lambda *a, **k: "iid")
     sent = []
     monkeypatch.setattr(swap, "_sign_and_send", lambda *a: sent.append(1))

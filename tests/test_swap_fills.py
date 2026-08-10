@@ -1,4 +1,4 @@
-"""Инварианты замера факта исполнения — аудит 07.08.
+﻿"""Инварианты замера факта исполнения — аудит 07.08.
 
 Три бага, найденные аудитом:
   1. buy() делил потраченные доллары на ВЕСЬ баланс токена, а не на купленное —
@@ -14,7 +14,7 @@ from src import helius, strategy, swap
 
 def test_покупка_считает_дельту_а_не_весь_баланс(monkeypatch):
     """На аккаунте уже лежит 1000 токенов; докупаем 500. Цена — по 500, не по 1500."""
-    monkeypatch.setattr(swap, "_settled_token_balance", lambda mint, before, tries=6: 1500.0)
+    monkeypatch.setattr(swap, "_settled_token_balance_raw", lambda mint, before, **k: (1_500_000_000, 6))
     before = 1000.0
     got = 1500.0 - before
     assert got == 500.0
@@ -29,7 +29,7 @@ def test_ожидание_расчёта_баланса_переживает_о�
     monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: next(seq))
     monkeypatch.setattr(swap.time, "sleep", lambda s: None)
     monkeypatch.setattr(swap.helius, "send_url", lambda: "https://send")
-    assert swap._settled_token_balance("mint", 1000.0) == 1500.0
+    assert swap._settled_token_balance_raw("mint", 1_000_000_000) == (1_500_000_000, 6)
 
 
 def test_ожидание_сдаётся_и_не_виснет(monkeypatch):
@@ -41,7 +41,7 @@ def test_ожидание_сдаётся_и_не_виснет(monkeypatch):
     monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: (1_000_000_000, 6, "ata"))
     monkeypatch.setattr(swap.time, "sleep", lambda s: None)
     monkeypatch.setattr(swap.helius, "send_url", lambda: "https://send")
-    assert swap._settled_token_balance("mint", 1000.0, tries=3) == 1000.0
+    assert swap._settled_token_balance_raw("mint", 1_000_000_000, tries=3) == (1_000_000_000, 6)
 
 
 def test_отправка_сделок_идёт_на_отдельный_узел(monkeypatch):

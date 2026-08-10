@@ -232,9 +232,33 @@ async def run(max_mc: float, seconds: int | None) -> None:
             return False
         return True
 
-    exiting: set[str] = set()      # токены, по которым выход уже выполняется
+    exiting: set[str] = set()          # токены, по которым выход уже выполняется
+    entering: dict[str, str] = {}      # токен → отложенная причина выхода, пока идёт покупка
 
     async def emit_exit(token: str, exit_price: float | None, reason: str) -> None:
+        """Защёлка от ДВОЙНОГО закрытия одной позиции (найдено аудитом 08.08).
+
+        ВТОРАЯ ЗАЩЁЛКА — ВХОД (найдена первым же часом живой торговли 10.08). Слот
+        резервируется вызовом pm.open() ДО отправки покупки, а покупка идёт несколько
+        секунд: котировка, сборка, отправка, подтверждение, расчёт баланса. Если в это
+        окно приходит продажа актора, выход видит открытую позицию и пытается продать
+        то, чего ещё нет:
+            [LIVE BUY FAIL]  6AiM14f1vDuS: simulation failed
+            [LIVE SELL FAIL] 6AiM14f1vDuS: токен остаётся у нас
+        Опаснее обратный случай: покупка УСПЕШНА, выход отработал в её окне, позиция
+        закрылась раньше, чем бот о ней узнал, — и токены остались сиротой.
+
+        Выход при этом НЕ теряем: запоминаем причину и исполняем сразу после покупки.
+        Терять нельзя — продажа актора закрывает 86% позиций.
+        """
+        if token in entering:
+            entering[token] = reason
+            print(f"[EXIT отложен] {token[:12]} покупка ещё идёт ({reason}) — "
+                  f"выйдем сразу после неё")
+            return
+        await _guarded_exit(token, exit_price, reason)
+
+    async def _guarded_exit(token: str, exit_price: float | None, reason: str) -> None:
         """Защёлка от ДВОЙНОГО закрытия одной позиции (найдено аудитом 08.08).
 
         Гонка: две продажи разных акторов приходят почти одновременно. Первая даёт
@@ -442,7 +466,13 @@ async def run(max_mc: float, seconds: int | None) -> None:
                 return
             entry_price = info.get("price_usd")
             if pm.open(token, entry_price, info.get("mc"), signal.actors, ev.ts):
-                bid = await do_buy(token, entry_price)
+                # пометка «идёт покупка»: выход по продаже актора в это окно будет
+                # отложен, а не выполнен вслепую по ещё не купленному токену (10.08)
+                entering[token] = ""
+                try:
+                    bid = await do_buy(token, entry_price)
+                finally:
+                    отложенный_выход = entering.pop(token, "")
                 if bid is None:
                     # в live покупка не прошла — откатываем слот, иначе бот будет
                     # вести позицию, которой в кошельке нет, и «продаст» пустоту
@@ -450,6 +480,12 @@ async def run(max_mc: float, seconds: int | None) -> None:
                     return
                 stats["opens"] += 1
                 pos_intent[token] = bid
+                if отложенный_выход:
+                    # выход, пришедший во время покупки, исполняем сразу: продажа
+                    # актора закрывает 86% позиций, терять этот сигнал нельзя
+                    print(f"[EXIT догоняет] {token[:12]} ({отложенный_выход})")
+                    await emit_exit(token, tracker.last.get(token) or entry_price,
+                                    отложенный_выход)
         print(f"[SIGNAL {signal.level}{'/quiet' if signal.quiet else ''}] {token} "
               f"n_actors={signal.n_actors} usd=${signal.window_usd} MC=${(mc or 0):,.0f} "
               f"safety={saf.get('verdict')} tg={alert} open={len(pm.open_tokens())}"

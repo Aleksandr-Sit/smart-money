@@ -1,4 +1,4 @@
-"""Токены в кошельке без открытой позиции — путь, которым живой режим теряет деньги.
+﻿"""Токены в кошельке без открытой позиции — путь, которым живой режим теряет деньги.
 
 Аудит 10.08: `swap.buy` ждал подтверждения CONFIRM_TIMEOUT_S секунд и при таймауте
 объявлял покупку неудачной. Монитор откатывал слот. Если транзакция подтверждалась
@@ -121,8 +121,8 @@ def test_покупка_без_подтверждения_но_с_токенам
     monkeypatch.setattr(swap, "_build_swap_tx", lambda q: {"swapTransaction": "x"})
     monkeypatch.setattr(swap, "_sign_and_send", lambda s: "SIG")
     monkeypatch.setattr(swap, "confirm", lambda s: False)          # не дождались вердикта
-    monkeypatch.setattr(swap, "token_balance", lambda m: (0.0, None))
-    monkeypatch.setattr(swap, "_settled_token_balance", lambda m, b, tries=6: 1000.0)
+    monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: (0, 6, None))
+    monkeypatch.setattr(swap, "_settled_token_balance_raw", lambda m, b, **k: (1_000_000_000, 6))
     monkeypatch.setattr(swap.ledger, "record_intent", lambda *a, **k: "iid")
     monkeypatch.setattr(swap.ledger, "record_fill", lambda *a, **k: None)
 
@@ -142,8 +142,8 @@ def test_ни_подтверждения_ни_токенов_отказ(monkeypa
     monkeypatch.setattr(swap, "_build_swap_tx", lambda q: {"swapTransaction": "x"})
     monkeypatch.setattr(swap, "_sign_and_send", lambda s: "SIG")
     monkeypatch.setattr(swap, "confirm", lambda s: False)
-    monkeypatch.setattr(swap, "token_balance", lambda m: (0.0, None))
-    monkeypatch.setattr(swap, "_settled_token_balance", lambda m, b, tries=6: 0.0)
+    monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: (0, 6, None))
+    monkeypatch.setattr(swap, "_settled_token_balance_raw", lambda m, b, **k: (0, 6))
     monkeypatch.setattr(swap.ledger, "record_intent", lambda *a, **k: "iid")
     monkeypatch.setattr(swap.ledger, "record_fill", lambda *a, **k: None)
 

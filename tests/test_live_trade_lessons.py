@@ -1,4 +1,4 @@
-"""Уроки ПЕРВОЙ живой сделки (10.08) и подготовка к работе не в полную силу.
+﻿"""Уроки ПЕРВОЙ живой сделки (10.08) и подготовка к работе не в полную силу.
 
 Пробная покупка USDC на $10 прошла на цепи (подпись 4zEM8vRK…, слот 438365865,
 err=None, 10.004341 USDC в кошельке), но код объявил её неудачной: публичный узел
@@ -58,7 +58,7 @@ def test_ожидание_возвращает_None_если_узлы_молча
                         lambda m, url=None: (_ for _ in ()).throw(RuntimeError("узел молчит")))
     monkeypatch.setattr(swap.time, "sleep", lambda s: None)
     monkeypatch.setattr(swap.helius, "send_url", lambda: "https://send")
-    assert swap._settled_token_balance("MINT", 0.0, tries=3) is None
+    assert swap._settled_token_balance_raw("MINT", 0, tries=3) == (None, 0)
 
 
 def test_ожидание_спрашивает_и_узел_отправки(monkeypatch):
@@ -74,7 +74,7 @@ def test_ожидание_спрашивает_и_узел_отправки(monk
     monkeypatch.setattr(swap, "token_balance_raw", _bal)
     monkeypatch.setattr(swap.time, "sleep", lambda s: None)
     monkeypatch.setattr(swap.helius, "send_url", lambda: "https://send")
-    assert swap._settled_token_balance("MINT", 0.0, tries=2) == 1.0
+    assert swap._settled_token_balance_raw("MINT", 0, tries=2) == (1_000_000, 6)
     assert "https://send" in видели
 
 
@@ -82,22 +82,48 @@ def test_реальный_сдвиг_баланса_возвращается_с�
     monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: (1_500_000, 6, "ata"))
     monkeypatch.setattr(swap.time, "sleep", lambda s: None)
     monkeypatch.setattr(swap.helius, "send_url", lambda: "https://send")
-    assert swap._settled_token_balance("MINT", 1.0, tries=6) == 1.5
+    assert swap._settled_token_balance_raw("MINT", 1_000_000, tries=6) == (1_500_000, 6)
+
+
+def test_проскальзывание_покупки_считается_в_ОДНИХ_единицах(monkeypatch):
+    """Первые живые покупки записали «проскальзывание 999999» = +99999900%.
+
+    quoted_price считалась как usd/outAmount (МИНИМАЛЬНЫЕ единицы), а actual_price
+    как usd/got (ЦЕЛЫЕ токены). Разница ровно в 10**decimals. Теперь сравниваем
+    количества, а не цены, — это вообще не зависит от decimals.
+    """
+    _мокнуть_покупку(monkeypatch, (2_312_316_111_457, 6))
+    r = swap.buy("MINT", 10.0)
+    assert r["action"] == "bought"
+    # заказывали 2312316111457 минимальных единиц, столько же и получили
+    assert r["slippage_vs_quote"] == pytest.approx(0.0, abs=1e-9)
+    assert r["tokens"] == pytest.approx(2_312_316.111457)
+    assert r["quoted_price"] == pytest.approx(10.0 / 2_312_316.111457)
+
+
+def test_недобор_токенов_это_отрицательное_проскальзывание(monkeypatch):
+    """Знак как у продажи: получили меньше обещанного — минус."""
+    _мокнуть_покупку(monkeypatch, (2_300_000_000_000, 6))
+    r = swap.buy("MINT", 10.0)
+    ожидали = 2_312_316_111_457
+    assert r["slippage_vs_quote"] == pytest.approx(2_300_000_000_000 / ожидали - 1)
+    assert r["slippage_vs_quote"] < 0
 
 
 # ---------- подтверждённая покупка не теряется ----------
-def _мокнуть_покупку(monkeypatch, settled):
+def _мокнуть_покупку(monkeypatch, settled, ожидаем="2312316111457"):
+    """settled — (баланс в минимальных единицах | None, decimals) после покупки."""
     monkeypatch.setitem(swap.strategy.EXECUTION, "LIVE_ENABLED", True)
     monkeypatch.setattr(swap.wallet, "Wallet",
                         lambda: type("W", (), {"available": True, "address": "a",
                                                "keypair": lambda s: "kp"})())
     monkeypatch.setattr(swap.market, "sol_price", lambda: 77.0)
-    monkeypatch.setattr(swap, "_quote", lambda a, b, c: {"outAmount": "1000"})
+    monkeypatch.setattr(swap, "_quote", lambda a, b, c: {"outAmount": ожидаем})
     monkeypatch.setattr(swap, "_build_swap_tx", lambda q: {"swapTransaction": "x"})
     monkeypatch.setattr(swap, "_sign_and_send", lambda s: "SIG")
     monkeypatch.setattr(swap, "confirm", lambda s: True)
-    monkeypatch.setattr(swap, "token_balance", lambda m: (0.0, None))
-    monkeypatch.setattr(swap, "_settled_token_balance", lambda m, b, **k: settled)
+    monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: (0, 6, None))
+    monkeypatch.setattr(swap, "_settled_token_balance_raw", lambda m, b, **k: settled)
     monkeypatch.setattr(swap.ledger, "record_intent", lambda *a, **k: "iid")
     monkeypatch.setattr(swap.ledger, "record_fill", lambda *a, **k: None)
 
@@ -109,7 +135,7 @@ def test_подтверждена_но_баланс_не_прочитан_поз
     в кошельке без присмотра. Выход продаёт ВЕСЬ остаток, поэтому точное
     количество для управления сделкой не нужно — теряем только замер.
     """
-    _мокнуть_покупку(monkeypatch, None)
+    _мокнуть_покупку(monkeypatch, (None, 0))
     r = swap.buy("MINT", 10.0)
     assert r["action"] == "bought"
     assert r["balance_unknown"] is True and r["tokens"] is None
@@ -118,7 +144,7 @@ def test_подтверждена_но_баланс_не_прочитан_поз
 
 def test_подтверждена_и_баланс_не_вырос_это_по_прежнему_отказ(monkeypatch):
     """Узел ответил и сказал «ноль» — вот это настоящее расхождение, торговать вслепую нельзя."""
-    _мокнуть_покупку(monkeypatch, 0.0)
+    _мокнуть_покупку(monkeypatch, (0, 6))
     with pytest.raises(swap.SwapError, match="баланс не вырос"):
         swap.buy("MINT", 10.0)
 

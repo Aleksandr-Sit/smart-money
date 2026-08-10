@@ -37,35 +37,28 @@ def _cfg() -> dict:
     return strategy.EXECUTION
 
 
-def _settled_token_balance(mint: str, before: float | None, tries: int = 12,
-                           pause: float = 2.5) -> float | None:
-    """Дождаться, пока баланс токена изменится после подтверждённой сделки.
+def _settled_token_balance_raw(mint: str, before_raw: int, tries: int = 12,
+                               pause: float = 2.5) -> tuple[int | None, int]:
+    """То же, но в МИНИМАЛЬНЫХ единицах. → (баланс | None, decimals).
 
-    → баланс, либо None если прочитать так и не удалось. None и 0 — РАЗНЫЕ ответы:
-    «не знаем» против «пусто». Их смешение и стоило нам первой живой сделки (10.08):
-    публичный узел не отдал баланс, код принял это за «токенов не прибавилось» и
-    объявил покупку неудачной, хотя 10 USDC уже лежали в кошельке.
-
-    Спрашиваем ПООЧЕРЁДНО узел чтения и узел ОТПРАВКИ: второй транзакцию видел
-    заведомо, потому что сам её принял, а узел чтения может отставать на слоты.
-    Окно ожидания 30с против прежних 9с — подтверждение приходит раньше, чем
-    состояние расходится по нодам.
+    Покупке нужны именно целые единицы: Jupiter отдаёт outAmount в них, и сравнивать
+    ожидание с фактом надо в одной системе. Пересчёт через uiAmount породил
+    «проскальзывание +99999900%» на первых живых покупках (10.08).
     """
-    if before is None:
-        before = 0.0
-    last = None
-    for i in range(tries):
+    last, dec = None, 0
+    for _ in range(tries):
         for url in (None, helius.send_url()):
             try:
-                raw, dec, _ = token_balance_raw(mint, url=url)
+                raw, d, _ata = token_balance_raw(mint, url=url)
             except Exception:  # noqa: BLE001
                 continue                      # узел не ответил — это НЕ «баланс нулевой»
-            bal = raw / (10 ** dec) if dec else float(raw)
-            last = bal
-            if abs(bal - before) > 1e-12:
-                return bal
+            if d:
+                dec = d
+            last = raw
+            if raw != before_raw:
+                return raw, dec
         time.sleep(pause)
-    return last
+    return last, dec
 
 
 def _settled_sol_balance(before: float | None, tries: int = 12,
@@ -90,14 +83,6 @@ def _settled_sol_balance(before: float | None, tries: int = 12,
                 return bal
         time.sleep(pause)
     return last
-
-
-def token_balance(mint: str) -> tuple[float, str | None]:
-    """(количество токенов, адрес ATA). (0, None) если аккаунта нет. Бросает при сбое узла."""
-    raw, _dec, ata = token_balance_raw(mint)
-    if ata is None:
-        return 0.0, None
-    return raw / (10 ** _dec), ata
 
 
 def token_balance_raw(mint: str, url: str | None = None) -> tuple[int, int, str | None]:
@@ -229,40 +214,53 @@ def buy(mint: str, usd: float | None = None) -> dict:
     sol_usd = market.sol_price()
     lamports = int(usd / sol_usd * _LAMPORTS)
     q = _quote(WSOL, mint, lamports)
-    tokens_expected = int(q["outAmount"])
-    quoted_price = usd / tokens_expected if tokens_expected else None
+    tokens_expected = int(q["outAmount"])          # МИНИМАЛЬНЫЕ единицы, не целые токены
+    # ЦЕНУ ЗА ЦЕЛЫЙ ТОКЕН здесь посчитать нечем: decimals известны только из токен-аккаунта,
+    # а его при первой покупке ещё не существует. Прежде сюда клали usd/outAmount — цену за
+    # минимальную единицу — и сравнивали её с фактической ценой за целый токен. Разница
+    # ровно в 10**decimals, отсюда «проскальзывание 999999» на первых живых покупках (10.08).
+    # Поэтому в намерение кладём КОЛИЧЕСТВО, а цену считаем на исполнении, когда decimals есть.
     # баланс ДО сделки: считать цену по итоговому балансу нельзя — при повторном входе
     # или после частичной продажи там лежат старые токены, и цена выйдет заниженной.
     # Не прочитали — не повод отказываться от сделки: потеряем только замер проскальзывания.
     try:
-        bal_before, _ = token_balance(mint)
+        raw_before, dec_before, _ = token_balance_raw(mint)
     except Exception as e:  # noqa: BLE001
         print(f"[swap] баланс до покупки не прочитан ({type(e).__name__}) — "
               f"сделка идёт, проскальзывание не измерим")
-        bal_before = None
+        raw_before, dec_before = None, 0
 
-    iid = ledger.record_intent("buy", mint, quoted_price, clip_usd=usd,
+    iid = ledger.record_intent("buy", mint, None, clip_usd=usd,
                                reason="signal", mode="live" if _live() else "dry",
-                               extra={"tokens_expected": tokens_expected,
+                               extra={"tokens_expected_raw": tokens_expected,
                                       "impact_pct": q.get("priceImpactPct")})
     if not _live():
         return {"action": "dry_run", "intent": iid, "tokens_expected": tokens_expected,
-                "quoted_price": quoted_price, "usd": usd}
+                "quoted_price": None, "usd": usd}
 
     swap = _build_swap_tx(q)               # содержит симуляцию: провал → исключение
     sig = _sign_and_send(swap)
     ok = confirm(sig)
-    bal_after = _settled_token_balance(mint, bal_before)
+    raw_after, dec = _settled_token_balance_raw(mint, raw_before if raw_before is not None else -1)
+    dec = dec or dec_before
     # None = баланс прочитать не удалось. Это НЕ ноль: подтверждённая транзакция уже
     # в блоке, токены наши, и отказываться от позиции из-за молчания узла нельзя —
     # именно так родилась первая живая сирота (10.08).
-    known = bal_after is not None and bal_before is not None
-    got = (bal_after - bal_before) if known else None
+    known = raw_after is not None and raw_before is not None
+    got_raw = (raw_after - raw_before) if known else None
+    got = (got_raw / 10 ** dec) if (got_raw is not None and dec) else None
+    quoted_price = (usd / (tokens_expected / 10 ** dec)) if (tokens_expected and dec) else None
     actual_price = (usd / got) if (got and got > 0) else None
-    slip = (actual_price / quoted_price - 1) if (actual_price and quoted_price) else None
+    # ЗНАК КАК У ПРОДАЖИ: меньше получили — отрицательное. Считаем по КОЛИЧЕСТВУ,
+    # чтобы не зависеть от decimals и не смешивать единицы (урок 10.08).
+    slip = (got_raw / tokens_expected - 1) if (got_raw and tokens_expected) else None
     ledger.record_fill(iid, mint, actual_price, usd=usd, tokens=got, signature=sig,
                        mode="live", extra={"confirmed": ok, "slippage_vs_quote": slip,
-                                           "balance_before": bal_before, "balance_after": bal_after})
+                                           "quoted_price": quoted_price,
+                                           "tokens_expected_raw": tokens_expected,
+                                           "tokens_got_raw": got_raw,
+                                           "balance_before_raw": raw_before,
+                                           "balance_after_raw": raw_after})
     if ok and got is None:
         # подтверждено, но количество неизвестно: позицию открываем (выход продаёт
         # ВЕСЬ остаток, точное число для управления сделкой не нужно), замер теряем
