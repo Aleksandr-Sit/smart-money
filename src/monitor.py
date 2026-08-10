@@ -15,8 +15,8 @@ import json
 import time
 from collections import deque
 
-from . import (config, delivery, execution, helius, helius_ws, ledger, market, positions, price_track,
-               log_parse, risk, safety, strategy, swap, sweep, tx_parse)
+from . import (config, delivery, execution, helius, helius_ws, ledger, market, orphans, positions,
+               price_track, log_parse, risk, safety, strategy, swap, sweep, tx_parse)
 from . import wallet as hot_wallet   # псевдоним: в on_event параметр называется wallet
 from .signal_engine import BuyEvent, SignalEngine, load_actor_map
 
@@ -495,6 +495,32 @@ async def run(max_mc: float, seconds: int | None) -> None:
                 await loop.run_in_executor(None, delivery.send_alert,
                                            f"ВЫВОД НЕ УДАЛСЯ: {type(e).__name__}: {str(e)[:100]}")
 
+    async def orphan_loop() -> None:
+        """Подбор токенов, оставшихся в кошельке без позиции (аудит 10.08).
+
+        Работает ТОЛЬКО в живом режиме: в бумажном кошелька не касаемся вовсе.
+        Путь появления сироты: покупка не подтвердилась за таймаут → монитор откатил
+        слот → транзакция дошла позже → токены есть, позиции нет, выйти некому.
+        Мем-коин без присмотра дешевеет за часы, поэтому подбираем, а не копим.
+        """
+        if not LIVE:
+            return
+        while True:
+            await asyncio.sleep(SWEEP_POLL_S)
+            try:
+                r = await loop.run_in_executor(None, orphans.recover, False)
+            except Exception as e:  # noqa: BLE001
+                print(f"[orphans] осмотр не удался: {type(e).__name__}: {e}")
+                continue
+            if r["orphans"] or r["failed"]:
+                msg = (f"подобрано сирот: {r['orphans']} на ${r['orphan_usd']:.2f}, "
+                       f"закрыто пустых аккаунтов {len(r['closed'])}")
+                if r["failed"]:
+                    msg += f"\nНЕ УДАЛОСЬ продать {len(r['failed'])}: " \
+                           + ", ".join(x["mint"][:10] for x in r["failed"][:5])
+                print(f"[orphans] {msg}", flush=True)
+                await loop.run_in_executor(None, delivery.send_alert, msg)
+
     async def heartbeat() -> None:
         def _rpc_alive() -> str:
             try:                              # живость Helius RPC (баланс кредитов через RPC недоступен)
@@ -552,7 +578,8 @@ async def run(max_mc: float, seconds: int | None) -> None:
                    f"(бюджет {helius.budget_report()}) · "
                    f"SOL=${market.sol_price():.2f} · rpc={_rpc_alive()}\n"
                    f"РИСК: {rm.status()}\n{ledger.summary()}\n"
-                   f"КОШЕЛЁК: {hot_wallet.status()}\n{sweep.status()}")
+                   f"КОШЕЛЁК: {hot_wallet.status()}\n{sweep.status()}"
+                   + (f"\n{orphans.status()}" if LIVE else ""))
             # дублируем в stdout: 07.08 диагностика упёрлась в то, что пульс уходил
             # только в Telegram и счётчики расхода RPC не было видно в docker logs
             print(f"[пульс] {msg.splitlines()[0]}", flush=True)
@@ -624,6 +651,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
     tasks.append(asyncio.create_task(tracker.run(on_tick=exit_tick)))   # выходы на 15с-цикле трекера
     tasks.append(asyncio.create_task(heartbeat()))
     tasks.append(asyncio.create_task(sweep_loop()))
+    tasks.append(asyncio.create_task(orphan_loop()))
     if seconds:
         await asyncio.sleep(seconds)
         for t in tasks:

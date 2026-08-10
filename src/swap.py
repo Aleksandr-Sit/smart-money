@@ -199,14 +199,22 @@ def buy(mint: str, usd: float | None = None) -> dict:
     ledger.record_fill(iid, mint, actual_price, usd=usd, tokens=got, signature=sig,
                        mode="live", extra={"confirmed": ok, "slippage_vs_quote": slip,
                                            "balance_before": bal_before, "balance_after": bal_after})
+    if got > 0:
+        # ФАКТ БАЛАНСА ВАЖНЕЕ ВЕРДИКТА ПОДТВЕРЖДЕНИЯ (аудит 10.08). Токены на счету —
+        # значит покупка состоялась, даже если confirm() не дождался статуса за таймаут.
+        # Прежний код в этом случае бросал исключение, монитор откатывал слот, и токены
+        # оставались в кошельке БЕЗ позиции: ни трекинга цены, ни выхода. Это был
+        # единственный путь, которым живой режим мог тихо потерять деньги.
+        return {"action": "bought", "signature": sig, "tokens": got, "confirmed": ok,
+                "quoted_price": quoted_price, "actual_price": actual_price,
+                "slippage_vs_quote": slip, "intent": iid}
     if not ok:
-        raise SwapError(f"покупка НЕ подтвердилась за таймаут, tx {sig} — проверить кошелёк")
-    if got <= 0:
-        # подтверждение есть, а токенов не прибавилось — расхождение, торговать вслепую нельзя
-        raise SwapError(f"покупка подтверждена, но баланс не вырос (tx {sig}) — проверить кошелёк")
-    return {"action": "bought", "signature": sig, "tokens": got,
-            "quoted_price": quoted_price, "actual_price": actual_price,
-            "slippage_vs_quote": slip, "intent": iid}
+        # токенов нет И подтверждения нет — транзакция может подтвердиться ПОЗЖЕ.
+        # Отказываем (позиции нет), но пометка нужна: подбирать такие токены будет orphans.
+        raise SwapError(f"покупка НЕ подтвердилась за таймаут, tx {sig} — токенов не прибавилось; "
+                        f"если транзакция дойдёт позже, токен подберёт разбор сирот")
+    # подтверждение есть, а токенов не прибавилось — расхождение, торговать вслепую нельзя
+    raise SwapError(f"покупка подтверждена, но баланс не вырос (tx {sig}) — проверить кошелёк")
 
 
 def sell(mint: str, fraction: float = 1.0, reason: str = "exit") -> dict:
