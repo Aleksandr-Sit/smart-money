@@ -208,8 +208,13 @@ async def run(max_mc: float, seconds: int | None) -> None:
         return r.get("intent")
 
     async def do_sell(token: str, fraction: float, price: float | None,
-                      reason: str, pid: str | None, net: float | None = None) -> bool:
-        """Продать долю позиции. False = продажа не прошла (в live токен всё ещё у нас)."""
+                      reason: str, pid: str | None,
+                      net: float | None = None) -> tuple[bool, float | None]:
+        """Продать долю позиции. → (получилось, фактическая выручка в долларах).
+
+        Выручка нужна для ЧЕСТНОГО учёта: результат сделки считается по деньгам,
+        а не по цене трекера (см. _emit_exit). None — выручку прочитать не удалось.
+        """
         if not LIVE:
             def _paper() -> None:
                 sid = ledger.record_intent("sell", token, price, reason=reason, mode="paper",
@@ -220,17 +225,17 @@ async def run(max_mc: float, seconds: int | None) -> None:
                                    extra={"reason": reason, "realized_net": net,
                                           "position_id": pid, "fraction": fraction})
             await loop.run_in_executor(None, _paper)
-            return True
+            return True, None
         try:
-            await loop.run_in_executor(None, swap.sell, token, fraction, reason)
+            r = await loop.run_in_executor(None, swap.sell, token, fraction, reason)
         except Exception as e:  # noqa: BLE001
             # токен остался у нас — это НЕ тихая ошибка, нужен человек
             print(f"[LIVE SELL FAIL] {token[:12]}: {type(e).__name__}: {str(e)[:120]}")
             await loop.run_in_executor(None, delivery.send_alert,
                                        f"ПРОДАЖА НЕ ПРОШЛА {token[:12]} ({reason}): "
                                        f"{str(e)[:150]} — токен ещё в кошельке, проверить вручную")
-            return False
-        return True
+            return False, None
+        return True, (r or {}).get("usd_actual")
 
     exiting: set[str] = set()          # токены, по которым выход уже выполняется
     entering: dict[str, str] = {}      # токен → отложенная причина выхода, пока идёт покупка
@@ -293,8 +298,6 @@ async def run(max_mc: float, seconds: int | None) -> None:
             # Ноль = утверждение «токен мёртв», которого мы не проверяли (аудит-6).
             exit_price = tracker.last.get(token) or p.entry_price
             stale = True
-        # замер фрикции В МОМЕНТ ВЫХОДА — ловит тонкую книгу при дампе (стресс-кейс)
-        await shadow(token, f"exit_{reason}")
         r = positions.total_realized(p, exit_price)   # с учётом частичных тейков
         # леджер: у КАЖДОЙ ноги своё намерение (иначе slippage считался бы как PnL сделки —
         # баг найден при сведении статистики 05.08). position_id связывает вход и выход.
@@ -303,13 +306,28 @@ async def run(max_mc: float, seconds: int | None) -> None:
         # ПРОДАЁМ ПЕРВЫМ ДЕЛОМ: сообщать о выходе, которого не случилось, нельзя.
         # fraction=1.0 — это ВЕСЬ остаток на кошельке; p.remaining измеряется от
         # исходной позиции и после частичного тейка означает другое число.
-        sold = await do_sell(token, 1.0, exit_price, reason, pid, net)
+        # SHADOW-ЗАМЕР УБРАН ОТСЮДА (10.08): две котировки Jupiter ради статистики
+        # стояли ПЕРЕД продажей и задерживали её. В живом режиме они и не нужны —
+        # настоящее проскальзывание теперь измеряется по деньгам.
+        sold, факт_usd = await do_sell(token, 1.0, exit_price, reason, pid, net)
         if not sold:
             pos_intent[token] = pid       # позиция ещё наша — вернуть связку для повтора
             return
-        await loop.run_in_executor(None, delivery.deliver_exit, p, exit_price, reason, True)
-        print(f"[EXIT {reason}] {token} realized={r:+.0%} "
-              f"(частичн {p.realized:+.0%}+ост {p.remaining:.2f}){' [ЦЕНА УСТАРЕЛА]' if stale else ''}")
+        if not LIVE:
+            await shadow(token, f"exit_{reason}")     # в бумажном режиме замер бесплатен
+        # ЧЕСТНЫЙ ИТОГ: в живом режиме считаем по ДЕНЬГАМ, а не по цене трекера.
+        # Цена трекера в момент actor-exit — это цена АКТОРА, за которым мы идём; мы
+        # продаём после него, в им же продавленную книгу. Замер на 52 живых сделках:
+        # модель +$99.10 против фактических +$37.63, разрыв −9.8% медиана на сделку.
+        факт = (факт_usd / rm.clip - 1) if факт_usd is not None else None
+        итог = факт if факт is not None else r
+        net = итог - (0.0 if факт is not None else strategy.RISK["EXIT_FEE"])
+        разрыв = (факт - r) if факт is not None else None
+        await loop.run_in_executor(None, delivery.deliver_exit, p, exit_price, reason, True,
+                                   итог, разрыв)
+        print(f"[EXIT {reason}] {token} realized={итог:+.0%}"
+              + (f" (модель {r:+.0%}, разрыв {разрыв:+.1%})" if разрыв is not None else "")
+              + (' [ЦЕНА УСТАРЕЛА]' if stale else ''))
         stats["exits"] += 1
         tripped = rm.on_close(net)
         if tripped:
@@ -682,8 +700,8 @@ async def run(max_mc: float, seconds: int | None) -> None:
                 before = p.remaining + res["frac"]
                 frac_of_wallet = res["frac"] / before if before > 1e-9 else 1.0
                 mult = (cur / p.entry_price) if (cur and p.entry_price) else 1.0
-                ok = await do_sell(token, frac_of_wallet, cur, res["reason"],
-                                   pos_intent.get(token), mult - 1)
+                ok, _факт = await do_sell(token, frac_of_wallet, cur, res["reason"],
+                                          pos_intent.get(token), mult - 1)
                 if not ok:
                     # токены остались у нас — вернуть учёт, иначе на выходе продадим меньше
                     pm.rollback_partial(token, res["frac"], mult)

@@ -413,8 +413,15 @@ def sell(mint: str, fraction: float = 1.0, reason: str = "exit") -> dict:
             raise SwapError(f"продажа ОТКЛОНЕНА сетью, tx {sig}: {причина} — "
                             f"токен остался у нас, выход будет повторён")
         raise SwapError(f"продажа НЕ подтвердилась за таймаут, tx {sig} — проверить кошелёк")
+    # ФАКТИЧЕСКАЯ ВЫРУЧКА наверх (10.08). Без неё монитор считал результат сделки по цене
+    # ТРЕКЕРА в момент срабатывания правила, а это цена актора, за которым мы идём. Мы
+    # продаём ПОСЛЕ него, в им же продавленную книгу. Замер на 52 живых сделках: модель
+    # +$99.10, деньги +$37.63, разрыв −9.8% медиана на сделку. Пока PnL считается по
+    # модели, каждый будущий замер стратегии завышен примерно на эту величину.
     return {"action": "sold", "signature": sig, "sol_out": sol_out,
-            "quoted_price": quoted_price, "ata_closed": closed, "intent": iid}
+            "quoted_price": quoted_price, "ata_closed": closed, "intent": iid,
+            "sol_actual": sol_got,
+            "usd_actual": (sol_got * sol_usd) if sol_got is not None else None}
 
 
 def close_token_account(mint: str) -> dict:

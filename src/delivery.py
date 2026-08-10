@@ -143,12 +143,22 @@ def format_exit(pos, exit_price: float, reason: str, realized_pnl: float) -> str
     return "\n".join(lines)
 
 
-def deliver_exit(pos, exit_price: float, reason: str, telegram: bool = True) -> None:
+def deliver_exit(pos, exit_price: float, reason: str, telegram: bool = True,
+                 realized_actual: float | None = None,
+                 exec_gap: float | None = None) -> None:
+    """realized_actual — итог ПО ДЕНЬГАМ (живой режим). Если задан, он и есть правда.
+
+    Модельный результат при этом сохраняется отдельным полем: сравнение двух чисел —
+    единственный способ видеть цену исполнения. Замер 10.08 на 52 живых сделках:
+    модель +$99.10, деньги +$37.63, разрыв −9.8% медиана на сделку.
+    """
     now = datetime.now(timezone.utc).isoformat()
     from .positions import total_realized
     # итоговый GROSS PnL с учётом ЧАСТИЧНЫХ тейков (реализованное + остаток по цене выхода)
-    realized = total_realized(pos, exit_price)
-    realized_net = realized - EXIT_FEE          # round-trip swap+priority ~6% (хайркат — не логируем)
+    model = total_realized(pos, exit_price)
+    realized = realized_actual if realized_actual is not None else model
+    # при фактическом итоге комиссии УЖЕ вычтены — они внутри полученных денег
+    realized_net = realized if realized_actual is not None else realized - EXIT_FEE
     # mode ОБЯЗАТЕЛЕН (10.08): без него живые и бумажные выходы в одном файле
     # неразличимы, и первая же неделя живой торговли испортит всю накопленную
     # статистику — разделить постфактум будет нечем.
@@ -156,6 +166,8 @@ def deliver_exit(pos, exit_price: float, reason: str, telegram: bool = True) -> 
            "mode": "live" if strategy.EXECUTION["LIVE_ENABLED"] else "paper",
            "token_mint": pos.token_mint, "reason": reason,
            "entry_price": pos.entry_price, "exit_price": exit_price, "realized_pnl": realized,
+           "realized_model": model, "exec_gap": exec_gap,
+           "pnl_source": "деньги" if realized_actual is not None else "модель",
            "realized_net": realized_net, "realized_partial": pos.realized, "remaining": pos.remaining,
            "entry_actors": len(pos.entry_actors), "exited_actors": len(pos.exited_actors),
            "entry_ts": pos.entry_ts, "entry_mc": pos.entry_mc}
