@@ -1,4 +1,4 @@
-"""Фаза D — исполнительное ядро: реальные свопы через Jupiter.
+﻿"""Фаза D — исполнительное ядро: реальные свопы через Jupiter.
 
 ПРИНЦИПЫ (модуль тратит настоящие деньги, поэтому паранойя обязательна):
   1. LIVE_ENABLED=false по умолчанию. Пока флаг выключен, модуль НЕ отправляет ничего,
@@ -124,12 +124,19 @@ def sell_amount_raw(raw_balance: int, fraction: float) -> int:
     return int(raw_balance * fraction)
 
 
-def _quote(input_mint: str, output_mint: str, amount_raw: int) -> dict:
+def _quote(input_mint: str, output_mint: str, amount_raw: int,
+           slippage_bps: int | None = None) -> dict:
     from . import execution
-    q = execution.quote(input_mint, output_mint, amount_raw, _cfg()["SLIPPAGE_BPS"])
+    bps = slippage_bps if slippage_bps is not None else _cfg()["SLIPPAGE_BPS"]
+    q = execution.quote(input_mint, output_mint, amount_raw, bps)
     if not q:
         raise SwapError(f"нет маршрута {input_mint[:6]}→{output_mint[:6]}")
     return q
+
+
+def _sell_slippage_bps() -> int:
+    """Допуск на ВЫХОДЕ. Отдельный от входа — см. обоснование в config/strategy.yaml."""
+    return int(_cfg().get("SLIPPAGE_BPS_SELL", _cfg()["SLIPPAGE_BPS"]))
 
 
 def _build_swap_tx(quote_resp: dict) -> dict:
@@ -180,21 +187,52 @@ def _sign_and_send(swap_resp: dict) -> str:
 
 def confirm(sig: str, timeout_s: int | None = None) -> bool:
     """Дождаться подтверждения. False = НЕ подтвердилось (обрабатывать как неудачу)."""
+    return confirm_detail(sig, timeout_s)[0]
+
+
+def confirm_detail(sig: str, timeout_s: int | None = None) -> tuple[bool, str | None]:
+    """→ (подтверждено, причина отказа). Причина None = не дождались, ошибки нет.
+
+    ЗАЧЕМ ОТДЕЛЬНО ОТ confirm (10.08). Алерты владельцу говорили «не подтвердилась за
+    таймаут», хотя на цепи транзакция УЖЕ упала с определённой ошибкой Custom 6001
+    (превышен допуск проскальзывания). Разница принципиальна: «не дождались» означает
+    неизвестность и возможного сироту, а «упала с ошибкой» — что денег не потрачено и
+    токенов нет. Диагноз в сообщении должен различать эти два случая.
+
+    Спрашиваем ОБА узла: узел чтения отстаёт на слоты, а узел отправки транзакцию
+    заведомо видел — он её и принял.
+    """
     timeout_s = timeout_s or _cfg()["CONFIRM_TIMEOUT_S"]
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        try:
-            r = helius.rpc("getSignatureStatuses", [[sig], {"searchTransactionHistory": True}])
+        for url in (None, helius.send_url()):
+            try:
+                r = helius.rpc("getSignatureStatuses",
+                               [[sig], {"searchTransactionHistory": True}], url=url)
+            except Exception:  # noqa: BLE001
+                continue
             st = ((r.get("result") or {}).get("value") or [None])[0]
-            if st:
-                if st.get("err"):
-                    return False
-                if st.get("confirmationStatus") in ("confirmed", "finalized"):
-                    return True
-        except Exception:  # noqa: BLE001
-            pass
+            if not st:
+                continue
+            if st.get("err"):
+                return False, _объяснить(st["err"])
+            if st.get("confirmationStatus") in ("confirmed", "finalized"):
+                return True, None
         time.sleep(2)
-    return False
+    return False, None
+
+
+def _объяснить(err) -> str:
+    """Код ошибки Solana → человеческая причина. Иначе в алерте одни цифры."""
+    s = str(err)
+    if "6001" in s or "0x1771" in s:
+        return ("превышен допуск проскальзывания (Jupiter 6001): цена ушла между "
+                "котировкой и исполнением; транзакция отклонена, деньги целы")
+    if "6000" in s or "0x1770" in s:
+        return "маршрут устарел (Jupiter 6000); транзакция отклонена, деньги целы"
+    if "insufficient" in s.lower():
+        return "не хватило средств на счёте"
+    return s[:160]
 
 
 def _live() -> bool:
@@ -240,7 +278,7 @@ def buy(mint: str, usd: float | None = None) -> dict:
 
     swap = _build_swap_tx(q)               # содержит симуляцию: провал → исключение
     sig = _sign_and_send(swap)
-    ok = confirm(sig)
+    ok, причина = confirm_detail(sig)
     raw_after, dec = _settled_token_balance_raw(mint, raw_before if raw_before is not None else -1)
     dec = dec or dec_before
     # None = баланс прочитать не удалось. Это НЕ ноль: подтверждённая транзакция уже
@@ -281,6 +319,10 @@ def buy(mint: str, usd: float | None = None) -> dict:
     if not ok:
         # токенов нет И подтверждения нет — транзакция может подтвердиться ПОЗЖЕ.
         # Отказываем (позиции нет), но пометка нужна: подбирать такие токены будет orphans.
+        if причина:
+            # транзакция ДОЛЕТЕЛА и упала с определённой ошибкой — денег не потрачено,
+            # токенов нет, сироты не будет. Это принципиально не то же самое, что таймаут.
+            raise SwapError(f"покупка ОТКЛОНЕНА сетью, tx {sig}: {причина}")
         raise SwapError(f"покупка НЕ подтвердилась за таймаут, tx {sig} — токенов не прибавилось; "
                         f"если транзакция дойдёт позже, токен подберёт разбор сирот")
     # подтверждение есть, а токенов не прибавилось — расхождение, торговать вслепую нельзя
@@ -309,7 +351,7 @@ def sell(mint: str, fraction: float = 1.0, reason: str = "exit") -> dict:
     if raw <= 0:
         return {"action": "skip", "reason": "сумма после округления = 0"}
 
-    q = _quote(mint, WSOL, raw)
+    q = _quote(mint, WSOL, raw, _sell_slippage_bps())
     sol_out = int(q["outAmount"]) / _LAMPORTS
     sol_usd = market.sol_price()
     # цену считаем по ТОМУ ЖЕ количеству, что уходит в котировку, а не по bal*fraction:
@@ -328,7 +370,7 @@ def sell(mint: str, fraction: float = 1.0, reason: str = "exit") -> dict:
     sol_before = w.balance_sol()
     swap = _build_swap_tx(q)
     sig = _sign_and_send(swap)
-    ok = confirm(sig)
+    ok, причина = confirm_detail(sig)
     # ФАКТ, а не котировка: раньше сюда писался quoted_price, поэтому измеренное
     # проскальзывание по продажам было тождественно нулю — ради его замера всё и строилось
     sol_after = _settled_sol_balance(sol_before)
@@ -350,6 +392,9 @@ def sell(mint: str, fraction: float = 1.0, reason: str = "exit") -> dict:
         except Exception as e:  # noqa: BLE001
             closed = {"action": "fail", "reason": f"{type(e).__name__}: {str(e)[:100]}"}
     if not ok:
+        if причина:
+            raise SwapError(f"продажа ОТКЛОНЕНА сетью, tx {sig}: {причина} — "
+                            f"токен остался у нас, выход будет повторён")
         raise SwapError(f"продажа НЕ подтвердилась за таймаут, tx {sig} — проверить кошелёк")
     return {"action": "sold", "signature": sig, "sol_out": sol_out,
             "quoted_price": quoted_price, "ata_closed": closed, "intent": iid}

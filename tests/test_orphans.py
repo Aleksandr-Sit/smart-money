@@ -120,7 +120,7 @@ def test_покупка_без_подтверждения_но_с_токенам
     monkeypatch.setattr(swap, "_quote", lambda a, b, c: {"outAmount": "1000"})
     monkeypatch.setattr(swap, "_build_swap_tx", lambda q: {"swapTransaction": "x"})
     monkeypatch.setattr(swap, "_sign_and_send", lambda s: "SIG")
-    monkeypatch.setattr(swap, "confirm", lambda s: False)          # не дождались вердикта
+    monkeypatch.setattr(swap, "confirm_detail", lambda s, t=None: (False, None))          # не дождались вердикта
     monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: (0, 6, None))
     monkeypatch.setattr(swap, "_settled_token_balance_raw", lambda m, b, **k: (1_000_000_000, 6))
     monkeypatch.setattr(swap.ledger, "record_intent", lambda *a, **k: "iid")
@@ -141,7 +141,7 @@ def test_ни_подтверждения_ни_токенов_отказ(monkeypa
     monkeypatch.setattr(swap, "_quote", lambda a, b, c: {"outAmount": "1000"})
     monkeypatch.setattr(swap, "_build_swap_tx", lambda q: {"swapTransaction": "x"})
     monkeypatch.setattr(swap, "_sign_and_send", lambda s: "SIG")
-    monkeypatch.setattr(swap, "confirm", lambda s: False)
+    monkeypatch.setattr(swap, "confirm_detail", lambda s, t=None: (False, None))
     monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: (0, 6, None))
     monkeypatch.setattr(swap, "_settled_token_balance_raw", lambda m, b, **k: (0, 6))
     monkeypatch.setattr(swap.ledger, "record_intent", lambda *a, **k: "iid")

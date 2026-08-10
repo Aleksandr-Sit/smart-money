@@ -121,7 +121,7 @@ def _мокнуть_покупку(monkeypatch, settled, ожидаем="2312316
     monkeypatch.setattr(swap, "_quote", lambda a, b, c: {"outAmount": ожидаем})
     monkeypatch.setattr(swap, "_build_swap_tx", lambda q: {"swapTransaction": "x"})
     monkeypatch.setattr(swap, "_sign_and_send", lambda s: "SIG")
-    monkeypatch.setattr(swap, "confirm", lambda s: True)
+    monkeypatch.setattr(swap, "confirm_detail", lambda s, t=None: (True, None))
     monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: (0, 6, None))
     monkeypatch.setattr(swap, "_settled_token_balance_raw", lambda m, b, **k: settled)
     monkeypatch.setattr(swap.ledger, "record_intent", lambda *a, **k: "iid")
