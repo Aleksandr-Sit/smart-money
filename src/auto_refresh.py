@@ -30,6 +30,7 @@ from .refresh_watchlist import WL, _load, diff_report
 
 CREDITS_NEEDED = 150      # оценка расхода (~110) + запас на разброс
 CREDITS_FLOOR = 300       # ниже этого остатка не запускаемся вовсе
+MATURITY_DAYS = 5         # столько дней токену нужно, чтобы стало видно: вырос или умер
 
 
 def credits_left() -> float | None:
@@ -84,9 +85,18 @@ def main() -> None:
     if WL.exists():
         shutil.copy(WL, backup)
 
-    since = (datetime.now(timezone.utc) - timedelta(days=args.days)).strftime("%Y-%m-%d")
-    for mod, margs in (("universe", ["--since", since, "--append"]),
-                       ("aggregate", []), ("flow_watchlist", [])):
+    # АРГУМЕНТЫ ДОЛЖНЫ СУЩЕСТВОВАТЬ (найдено 10.08 при разборе первого автозапуска).
+    # Здесь стояло universe --since, а у universe такого ключа нет — есть --launch-start
+    # и --launch-end. Первый же шаг падал с «unrecognized arguments», и автообновление
+    # не могло отработать НИ РАЗУ. Откат сработал, список уцелел, но функция была мертва.
+    # Плюс aggregate звался вообще без --since и потому брал свой дефолт от 26 июня.
+    now = datetime.now(timezone.utc)
+    since = (now - timedelta(days=args.days)).strftime("%Y-%m-%d")
+    # верхняя граница окна — не «сегодня»: токену нужно MATURITY_DAYS дней, чтобы стало
+    # видно, вырос он или умер. Иначе в когорту попадёт незрелое и разметка поедет.
+    until = (now - timedelta(days=MATURITY_DAYS)).strftime("%Y-%m-%d")
+    for mod, margs in (("universe", ["--launch-start", since, "--launch-end", until, "--append"]),
+                       ("aggregate", ["--since", since]), ("flow_watchlist", [])):
         ok, err = _run(mod, margs)
         if not ok:
             if backup.exists():
