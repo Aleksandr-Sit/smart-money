@@ -53,6 +53,23 @@ def record_fill(intent_id: str, token: str, price: float | None, usd: float,
              "signature": signature, **(extra or {})})
 
 
+def record_reject(intent_id: str, token: str, reason: str, signature: str | None = None,
+                  mode: str = "live", extra: dict | None = None) -> None:
+    """Записать НЕСОСТОЯВШУЮСЯ сделку. Это НЕ исполнение — денег не двигалось.
+
+    ЗАЧЕМ (найдено 10.08 при пересчёте отказов). Транзакция, долетевшая до цепи и
+    упавшая там, всё равно писала fill: с confirmed=false, с суммой из котировки и
+    нулевым количеством. В учёте она выглядела состоявшейся сделкой на $10, раздувала
+    gross_usd и — главное — маскировала долю отказов: мой первый замер дал 22% вместо
+    настоящих 35%, потому что считал провалом только отклонение на предполёте.
+
+    Отдельный тип записи, а не отсутствие записи: попытка была, деньги на комиссию
+    потрачены, и след этого нужен.
+    """
+    _append({"ts": _now(), "type": "reject", "intent_id": intent_id, "mode": mode,
+             "token_mint": token, "reason": reason, "signature": signature, **(extra or {})})
+
+
 def load(path=None) -> list[dict]:
     p = path or (config.OUTPUT_DIR / PATH)
     if not p.exists():
@@ -74,6 +91,9 @@ def reconcile(rows: list[dict] | None = None) -> dict:
             fills[r.get("intent_id")].append(r)
 
     orphan_fills = [r for r in rows if r.get("type") == "fill" and r.get("intent_id") not in intents]
+    rejects = [r for r in rows if r.get("type") == "reject"]
+    # намерение без исполнения = сделка не состоялась. Отклонённая на цепи попытка
+    # тоже сюда: она пишет reject, а не fill (правка 10.08).
     unfilled = [i for iid, i in intents.items() if iid not in fills]
     slippages = []
     gross_usd = 0.0
@@ -99,6 +119,8 @@ def reconcile(rows: list[dict] | None = None) -> dict:
         "fills": sum(len(v) for v in fills.values()),
         "unfilled": len(unfilled),            # намерения без исполнения (в live = провал tx!)
         "orphan_fills": len(orphan_fills),    # исполнение без намерения = ТРЕВОГА
+        "rejects": len(rejects),              # попытки, не дошедшие до сделки
+        "reject_rate": (len(unfilled) / len(intents)) if intents else 0.0,
         "crossed_legs": crossed,              # исторические пары «выход подшит к покупке»
         "median_slippage": statistics.median(slippages) if slippages else None,
         "worst_slippage": min(slippages) if slippages else None,
@@ -117,8 +139,9 @@ def summary() -> str:
     sl_txt = f"медиана slippage {sl}" if live else "slippage: нет живых сделок"
     flag = "✅" if r["ok"] else "🛑 ЕСТЬ ИСПОЛНЕНИЯ БЕЗ НАМЕРЕНИЙ"
     extra = f", старых кросс-пар {r['crossed_legs']}" if r["crossed_legs"] else ""
+    отк = f" · отказов {r['rejects']} ({r['reject_rate']:.0%})" if r["rejects"] else ""
     return (f"{flag} леджер: намерений {r['intents']}, исполнений {r['fills']}, "
-            f"без исполнения {r['unfilled']}{extra}, {sl_txt}")
+            f"без исполнения {r['unfilled']}{extra}{отк}, {sl_txt}")
 
 
 if __name__ == "__main__":

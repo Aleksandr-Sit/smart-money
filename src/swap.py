@@ -292,13 +292,21 @@ def buy(mint: str, usd: float | None = None) -> dict:
     # ЗНАК КАК У ПРОДАЖИ: меньше получили — отрицательное. Считаем по КОЛИЧЕСТВУ,
     # чтобы не зависеть от decimals и не смешивать единицы (урок 10.08).
     slip = (got_raw / tokens_expected - 1) if (got_raw and tokens_expected) else None
-    ledger.record_fill(iid, mint, actual_price, usd=usd, tokens=got, signature=sig,
-                       mode="live", extra={"confirmed": ok, "slippage_vs_quote": slip,
-                                           "quoted_price": quoted_price,
-                                           "tokens_expected_raw": tokens_expected,
-                                           "tokens_got_raw": got_raw,
-                                           "balance_before_raw": raw_before,
-                                           "balance_after_raw": raw_after})
+    состоялась = bool(got_raw and got_raw > 0) or (ok and got is None)
+    if not состоялась:
+        # ИСПОЛНЕНИЯ НЕ БЫЛО — и записывать его нельзя. Прежде сюда писался fill с
+        # суммой из котировки и нулевым количеством: в учёте это выглядело сделкой
+        # на $10 и маскировало долю отказов (35% вместо показанных 22%).
+        ledger.record_reject(iid, mint, причина or "нет подтверждения за таймаут",
+                             signature=sig, extra={"confirmed": ok, "side": "buy"})
+    else:
+        ledger.record_fill(iid, mint, actual_price, usd=usd, tokens=got, signature=sig,
+                           mode="live", extra={"confirmed": ok, "slippage_vs_quote": slip,
+                                               "quoted_price": quoted_price,
+                                               "tokens_expected_raw": tokens_expected,
+                                               "tokens_got_raw": got_raw,
+                                               "balance_before_raw": raw_before,
+                                               "balance_after_raw": raw_after})
     if ok and got is None:
         # подтверждено, но количество неизвестно: позицию открываем (выход продаёт
         # ВЕСЬ остаток, точное число для управления сделкой не нужно), замер теряем
@@ -377,12 +385,21 @@ def sell(mint: str, fraction: float = 1.0, reason: str = "exit") -> dict:
     sol_got = (sol_after - sol_before) if (sol_after is not None and sol_before is not None) else None
     actual_price = (sol_got * sol_usd / tokens_sold) if (sol_got and tokens_sold) else None
     slip = (actual_price / quoted_price - 1) if (actual_price and quoted_price) else None
-    ledger.record_fill(iid, mint, actual_price or quoted_price,
-                       usd=(sol_got * sol_usd) if sol_got else sol_out * sol_usd,
-                       tokens=tokens_sold, signature=sig, mode="live",
-                       extra={"confirmed": ok, "reason": reason, "quoted_price": quoted_price,
-                              "sol_quoted": sol_out, "sol_actual": sol_got,
-                              "slippage_vs_quote": slip})
+    if not ok:
+        # ПРОДАЖИ НЕ БЫЛО — токены остались у нас. Писать сюда fill с суммой из
+        # котировки означало бы утверждать, что выручка получена (правка 10.08).
+        ledger.record_reject(iid, mint, причина or "нет подтверждения за таймаут",
+                             signature=sig, extra={"confirmed": ok, "side": "sell",
+                                                   "reason_exit": reason,
+                                                   "sol_quoted": sol_out})
+    else:
+        ledger.record_fill(iid, mint, actual_price or quoted_price,
+                           usd=(sol_got * sol_usd) if sol_got else sol_out * sol_usd,
+                           tokens=tokens_sold, signature=sig, mode="live",
+                           extra={"confirmed": ok, "reason": reason,
+                                  "quoted_price": quoted_price,
+                                  "sol_quoted": sol_out, "sol_actual": sol_got,
+                                  "slippage_vs_quote": slip})
     closed = None
     if ok and fraction >= 1.0:
         # рента ~$0.15 приятна, но продажа уже состоялась — сбой на закрытии аккаунта
