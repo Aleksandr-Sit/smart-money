@@ -61,6 +61,56 @@ def _settled_token_balance_raw(mint: str, before_raw: int, tries: int = 12,
     return last, dec
 
 
+def tx_deltas(sig: str, mint: str, tries: int = 10,
+              pause: float = 2.0) -> tuple[float | None, int | None, int]:
+    """Движение денег ИЗ САМОЙ ТРАНЗАКЦИИ. → (дельта SOL, дельта токена в ед., decimals).
+
+    ЗАЧЕМ (найдено 10.08 по выходу с невозможным итогом −200%). Прежде выручка
+    считалась как изменение баланса ВСЕГО кошелька до и после продажи. Пока сделки
+    идут по одной, это работает. Но бот держит до пяти позиций, и параллельная
+    ПОКУПКА тратит SOL в то же окно: замер приписал чужой расход нашей продаже и
+    выдал sol_actual = −0.131 SOL, то есть ровно минус один клип.
+
+        realized_pnl −200.1% при цене выхода 0.96x — невозможное число для спот-лонга.
+
+    Дельта внутри транзакции чужих операций не видит по определению. Комиссия в неё
+    входит, и это правильно: нас интересуют чистые деньги, а не валовая выручка.
+    """
+    w = wallet.Wallet()
+    if not w.available:
+        return None, None, 0
+    for _ in range(tries):
+        for url in (helius.send_url(), None):
+            try:
+                r = helius.rpc("getTransaction",
+                               [sig, {"encoding": "jsonParsed",
+                                      "maxSupportedTransactionVersion": 0,
+                                      "commitment": "confirmed"}], url=url)
+            except Exception:  # noqa: BLE001
+                continue
+            res = r.get("result")
+            if not res:
+                continue
+            m = res["meta"]
+            keys = [k["pubkey"] if isinstance(k, dict) else k
+                    for k in res["transaction"]["message"]["accountKeys"]]
+            if w.address not in keys:
+                return None, None, 0
+            i = keys.index(w.address)
+            sol_d = (m["postBalances"][i] - m["preBalances"][i]) / _LAMPORTS
+
+            def _amt(key):
+                for b in (m.get(key) or []):
+                    if b.get("owner") == w.address and b.get("mint") == mint:
+                        return int(b["uiTokenAmount"]["amount"]), int(b["uiTokenAmount"]["decimals"])
+                return 0, 0
+            pre, d1 = _amt("preTokenBalances")
+            post, d2 = _amt("postTokenBalances")
+            return sol_d, post - pre, (d2 or d1)
+        time.sleep(pause)
+    return None, None, 0
+
+
 def _settled_sol_balance(before: float | None, tries: int = 12,
                          pause: float = 2.5) -> float | None:
     """То же для SOL: ждём, пока баланс сдвинется после продажи.
@@ -375,14 +425,19 @@ def sell(mint: str, fraction: float = 1.0, reason: str = "exit") -> dict:
         return {"action": "dry_run", "intent": iid, "quoted_price": quoted_price,
                 "sol_out": sol_out, "fraction": fraction}
 
-    sol_before = w.balance_sol()
     swap = _build_swap_tx(q)
     sig = _sign_and_send(swap)
     ok, причина = confirm_detail(sig)
-    # ФАКТ, а не котировка: раньше сюда писался quoted_price, поэтому измеренное
-    # проскальзывание по продажам было тождественно нулю — ради его замера всё и строилось
-    sol_after = _settled_sol_balance(sol_before)
-    sol_got = (sol_after - sol_before) if (sol_after is not None and sol_before is not None) else None
+    # ФАКТ ИЗ САМОЙ ТРАНЗАКЦИИ, а не из баланса кошелька: параллельная покупка другой
+    # позиции тратит SOL в то же окно, и разница балансов приписывала её нашей продаже
+    # (найдено 10.08 по выходу с невозможным −200%).
+    sol_got, _tok_d, _dec = tx_deltas(sig, mint) if ok else (None, None, 0)
+    if sol_got is not None and sol_got <= 0:
+        # продажа обязана ПРИНОСИТЬ SOL. Ноль или минус = мы что-то измерили не так,
+        # и лучше признать это, чем записать выдуманное число.
+        print(f"[swap] {mint[:12]} продажа дала {sol_got:+.6f} SOL — это не выручка, "
+              f"выручку считаем неизвестной")
+        sol_got = None
     actual_price = (sol_got * sol_usd / tokens_sold) if (sol_got and tokens_sold) else None
     slip = (actual_price / quoted_price - 1) if (actual_price and quoted_price) else None
     if not ok:

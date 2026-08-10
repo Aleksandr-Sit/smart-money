@@ -29,7 +29,8 @@ def _мок(monkeypatch, записи, ok, причина, settled=(0, 6), ба�
     monkeypatch.setattr(swap, "confirm_detail", lambda s, t=None: (ok, причина))
     monkeypatch.setattr(swap, "token_balance_raw", lambda m, url=None: (баланс, 6, "ata"))
     monkeypatch.setattr(swap, "_settled_token_balance_raw", lambda m, b, **k: settled)
-    monkeypatch.setattr(swap, "_settled_sol_balance", lambda b, **k: b)
+    # выручка читается из транзакции (правка 10.08) — иначе тест уходит в сеть
+    monkeypatch.setattr(swap, "tx_deltas", lambda s, m, **k: (0.13, -1_000_000, 6))
     monkeypatch.setattr(swap.ledger, "record_intent", lambda *a, **k: "iid")
     monkeypatch.setattr(swap.ledger, "record_fill",
                         lambda *a, **k: записи.append(("fill", a, k)))
