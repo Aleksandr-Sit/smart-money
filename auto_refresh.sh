@@ -15,25 +15,20 @@ fi
 LOG=logs/auto_refresh_$(date -u +%Y%m%d).log
 mkdir -p logs
 echo "=== $(date -u) старт автообновления ===" >> "$LOG"
-# СНИМОК ПРЕЖНЕГО СПИСКА до запуска discovery: он перезапишет flow_watchlist.json
-# своими кандидатами, а нам нужно с чем сливать (аудит 09.08 — замена вместо
-# слияния стоила бы 3831 сделки и 4153$).
+# СНИМОК ПРЕЖНЕГО СПИСКА — страховка на случай, если контейнер умрёт между записью
+# discovery и слиянием. Само слияние живёт ВНУТРИ src.auto_refresh (правка 10.08):
+# так отчёт в Telegram описывает итоговый список, а не промежуточный результат
+# discovery, и не шлёт ложное «приоритетный актор выбыл».
 cp output/flow_watchlist.json output/flow_watchlist_prev.json 2>/dev/null
 
 OUT=$(docker compose run --rm discovery 2>&1)
 echo "$OUT" >> "$LOG"
 touch "$STAMP"
 
-# СЛИЯНИЕ: кандидаты discovery + акторы, проверенные нашими живыми сделками.
-# Выбрасываются только те, чьё молчание подтверждено наблюдением.
-if echo "$OUT" | grep -q REFRESH_OK; then
-  MERGE=$(docker compose run --rm discovery python -m src.merge_watchlist 2>&1)
-  echo "$MERGE" >> "$LOG"
-  if ! echo "$MERGE" | grep -q "MERGE_OK"; then
-    # слияние не удалось — откатываемся на прежний список, а не торгуем по куцему
-    cp output/flow_watchlist_prev.json output/flow_watchlist.json 2>/dev/null
-    echo "СЛИЯНИЕ НЕ УДАЛОСЬ — восстановлен прежний список" >> "$LOG"
-  fi
+if ! echo "$OUT" | grep -q REFRESH_OK; then
+  # обновление не дошло до конца — вернуть заведомо рабочий список и не трогать монитор
+  cp output/flow_watchlist_prev.json output/flow_watchlist.json 2>/dev/null
+  echo "ОБНОВЛЕНИЕ НЕ УДАЛОСЬ — восстановлен прежний список" >> "$LOG"
 fi
 
 if echo "$OUT" | grep -q REFRESH_OK; then

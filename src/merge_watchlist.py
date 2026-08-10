@@ -32,32 +32,43 @@ from . import analysis, config
 WL = config.OUTPUT_DIR / "flow_watchlist.json"
 
 
-def _seen_actors(wallet_to_actor: dict[str, str]) -> set[str]:
-    """Акторы, подавшие хотя бы один сигнал за всё время наблюдения."""
+def _scan_signals(wallet_to_actor: dict[str, str]) -> tuple[set[str], float]:
+    """Один проход по signals.log → (акторы, подавшие хоть один сигнал; суток наблюдения).
+
+    ОДИН проход, а не три: файл 11 МБ, и разбирать его несколько раз незачем.
+
+    ВАЖНО (найдено аудитом 10.08): signals.log хранит ДВА вида записей — сигналы и
+    выходы (delivery.deliver_exit пишет туда же). Прежняя версия брала ПЕРВУЮ и
+    ПОСЛЕДНЮЮ строку файла и искала в них ключ "signal". Последняя строка почти
+    всегда запись выхода, ключа там нет → срок наблюдения выходил 0 суток → порог
+    min_days не достигался → ветка исключения молчунов не выполнялась НИ РАЗУ.
+    Направление отказа безопасное (никого не выбрасываем), но функция была мертва.
+    """
     seen: set[str] = set()
+    lo = hi = None
     for r in analysis.read_jsonl("signals.log"):
         s = r.get("signal")
         if not s:
-            continue
+            continue                       # запись выхода, а не сигнал
+        t = s.get("ts")
+        if t:
+            lo = t if lo is None else min(lo, t)
+            hi = t if hi is None else max(hi, t)
         for a in s.get("actors", []):
             seen.add(a)
             seen.add(wallet_to_actor.get(a, a))
-    return seen
+    days = (hi - lo) / 86400 if (lo is not None and hi is not None) else 0.0
+    return seen, days
+
+
+def _seen_actors(wallet_to_actor: dict[str, str]) -> set[str]:
+    """Акторы, подавшие хотя бы один сигнал за всё время наблюдения."""
+    return _scan_signals(wallet_to_actor)[0]
 
 
 def _observation_days() -> float:
     """Сколько суток мы вообще наблюдаем. Мало данных → не выбрасываем никого."""
-    ts = []
-    for r in analysis.read_jsonl("signals.log")[:1]:
-        s = r.get("signal")
-        if s:
-            ts.append(s["ts"])
-    last = analysis.read_jsonl("signals.log")[-1:] or []
-    for r in last:
-        s = r.get("signal")
-        if s:
-            ts.append(s["ts"])
-    return (max(ts) - min(ts)) / 86400 if len(ts) >= 2 else 0.0
+    return _scan_signals({})[1]
 
 
 def merge(candidates: list[dict], current: list[dict], min_days: float = 14.0,

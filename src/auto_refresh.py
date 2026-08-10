@@ -17,6 +17,7 @@ Run (в контейнере discovery):  python -m src.auto_refresh --days 30
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -24,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-from . import config, delivery, strategy
+from . import config, delivery, merge_watchlist, strategy
 from .refresh_watchlist import WL, _load, diff_report
 
 CREDITS_NEEDED = 150      # оценка расхода (~110) + запас на разброс
@@ -94,19 +95,35 @@ def main() -> None:
                                 f"Откат на прежний список ({len(old)} акторов, {age_d:.0f} дн)")
             return
 
-    new = _load(WL)
+    # СЛИЯНИЕ, а не замена. discovery отбирает по своим формальным признакам и не знает
+    # нашей статистики: проверка первой свежей выгрузки на 8031 нашей сделке показала, что
+    # замена потеряла бы 3831 сделку и 4153$, причём оба приоритетных актора в выгрузку не
+    # попали, хотя активны. Слияние идёт ЗДЕСЬ, до отчёта, — иначе Telegram описывал бы
+    # промежуточный результат discovery и слал ложное «приоритетный актор выбыл» (10.08).
+    cand = _load(WL)
+    merged, mrep = merge_watchlist.merge(list(cand.values()), list(old.values()))
+    new = {a["actor_id"]: a for a in merged}
     if not new or len(new) < 5:
         if backup.exists():
             shutil.copy(backup, WL)
         delivery.send_alert(f"автообновление watchlist: результат пустой/подозрительный "
                             f"({len(new)} акторов) → ОТКАТ на прежний ({len(old)})")
         return
+    WL.write_text(json.dumps(merged, ensure_ascii=False, indent=1), encoding="utf-8")
 
     after = credits_left()
     spent = (before - after) if after is not None else None
     gone_priority = [a for a in strategy.ENTRY["PRIORITY_ACTORS"] if a not in new]
 
-    msg = ["🔄 WATCHLIST ОБНОВЛЁН автоматически", "", diff_report(old, new), ""]
+    msg = ["🔄 WATCHLIST ОБНОВЛЁН автоматически", "", diff_report(old, new), "",
+           f"кандидатов discovery: {mrep['кандидатов']} · добавлено новых: "
+           f"{mrep['добавлено_новых']} · выброшено молчунов: {mrep['выброшено_молчунов']} · "
+           f"на испытательном сроке: {mrep['на_испытательном']}",
+           f"итого {mrep['итого_акторов']} акторов / {mrep['итого_кошельков']} кошельков "
+           f"(наблюдение {mrep['наблюдение_суток']} сут)"]
+    if mrep["порог_не_достигнут"]:
+        msg.append("наблюдений мало — никого не исключал")
+    msg.append("")
     if spent is not None:
         msg.append(f"кредитов потрачено: {spent:.0f}, осталось {after:.0f}")
     if gone_priority:

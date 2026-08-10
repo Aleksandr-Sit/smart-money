@@ -86,6 +86,31 @@ def test_повторный_запуск_ничего_не_меняет(monkeypa
     assert rep["выброшено_молчунов"] == 0 and rep["добавлено_новых"] == 0
 
 
+def test_срок_наблюдения_не_обнуляется_записью_выхода(monkeypatch):
+    """signals.log хранит И сигналы, И выходы (deliver_exit пишет туда же).
+
+    Дефект, найденный аудитом 10.08: срок наблюдения брался из ПЕРВОЙ и ПОСЛЕДНЕЙ
+    строки файла. Последняя строка почти всегда запись выхода — ключа "signal" в ней
+    нет, отметка времени не набиралась, срок выходил 0 суток, порог min_days не
+    достигался, и ветка исключения молчунов не выполнялась НИ РАЗУ.
+    """
+    day = 86400
+    журнал = [
+        {"ts": "x", "signal": {"ts": 1_000_000.0, "actors": ["A"]}},
+        {"ts": "x", "type": "exit", "token_mint": "T"},          # выход, не сигнал
+        {"ts": "x", "signal": {"ts": 1_000_000.0 + 30 * day, "actors": ["B"]}},
+        {"ts": "x", "type": "exit", "token_mint": "T2"},          # ПОСЛЕДНЯЯ строка — выход
+    ]
+    monkeypatch.setattr(mw.analysis, "read_jsonl", lambda *a, **k: журнал)
+    seen, days = mw._scan_signals({})
+    assert days == pytest.approx(30.0), "выход в конце файла не должен обнулять срок"
+    assert seen == {"A", "B"}
+    # и сквозь merge: молчун теперь действительно выбрасывается
+    out, rep = mw.merge([], [_a("молчун", ["w1"], added_ts=time.time() - 60 * day)])
+    assert rep["порог_не_достигнут"] is False and rep["выброшено_молчунов"] == 1
+    assert out == []
+
+
 def test_новому_актору_проставляется_дата_добавления(monkeypatch):
     monkeypatch.setattr(mw, "_observation_days", lambda: 30.0)
     monkeypatch.setattr(mw, "_seen_actors", lambda w2a: set())
