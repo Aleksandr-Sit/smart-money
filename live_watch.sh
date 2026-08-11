@@ -25,6 +25,13 @@ from src import delivery, orphans, positions, strategy, wallet
 ПРОБЛЕМЫ = []
 СОСТ = "/app/output/.live_watch_state"
 
+# РЕЖИМ РЕШАЕТ, ЧТО ВООБЩЕ ИМЕЕТ СМЫСЛ ПРОВЕРЯТЬ (правка 11.08). В бумажном режиме
+# кошелёк не двигается НИКОГДА, поэтому сверка учёта с кошельком выдавала расхождение
+# каждый час и была чистым шумом. Тем же шумом были «ТОРГОВЛЯ ОСТАНОВЛЕНА» (в shadow
+# дневной стоп не блокирует входы) и заголовок про живую торговлю.
+ЖИВОЙ = bool(strategy.EXECUTION["LIVE_ENABLED"])
+РЕЖИМ = "ЖИВАЯ ТОРГОВЛЯ" if ЖИВОЙ else "БУМАЖНЫЙ РЕЖИМ"
+
 def prev():
     try:
         return json.load(open(СОСТ))
@@ -34,32 +41,39 @@ def prev():
 было = prev()
 now = time.time()
 
-# --- 1. кошелёк ---
+# --- 1. кошелёк (только когда торгуем деньгами) ---
 w = wallet.Wallet()
 sol = w.balance_sol()
-if sol is None:
-    ПРОБЛЕМЫ.append("баланс кошелька НЕ ЧИТАЕТСЯ — узел молчит")
-elif sol < 0.2:
-    ПРОБЛЕМЫ.append(f"на кошельке всего {sol:.3f} SOL — торговать скоро будет нечем")
+if ЖИВОЙ:
+    if sol is None:
+        ПРОБЛЕМЫ.append("баланс кошелька НЕ ЧИТАЕТСЯ — узел молчит")
+    elif sol < 0.2:
+        ПРОБЛЕМЫ.append(f"на кошельке всего {sol:.3f} SOL — торговать скоро будет нечем")
 
 # --- 2. счётчик риска и дневной стоп ---
 rs = json.load(open("/app/output/risk_state.json"))
 лимит = -strategy.RISK["DAILY_STOP_FRAC"] * strategy.RISK["BANKROLL_USD"]
 if rs.get("halted"):
-    ПРОБЛЕМЫ.append(f"ТОРГОВЛЯ ОСТАНОВЛЕНА: {rs.get('halt_reason')}")
+    # в shadow стоп НЕ режет поток: он лишь помечает состояние, поэтому и тревога другая
+    if ЖИВОЙ:
+        ПРОБЛЕМЫ.append(f"ТОРГОВЛЯ ОСТАНОВЛЕНА: {rs.get('halt_reason')}")
+    else:
+        ПРОБЛЕМЫ.append(f"на бумаге сработал бы дневной стоп: {rs.get('halt_reason')} "
+                        f"(входы НЕ блокируются, режим shadow)")
 elif rs["realized_usd"] <= лимит * 0.7:
     ПРОБЛЕМЫ.append(f"дневной убыток ${rs['realized_usd']:.2f} подходит к стопу ${лимит:.0f}")
 
-# --- 3. сироты: токены без позиции ---
-try:
-    r = orphans.scan()
-    if r["orphan"]:
-        ПРОБЛЕМЫ.append(f"СИРОТ {len(r['orphan'])} на ${r['orphan_usd']:.2f} — "
-                        f"токены без позиции: {', '.join(a['mint'][:10] for a in r['orphan'][:3])}")
-    if len(r["empty"]) > 5:
-        ПРОБЛЕМЫ.append(f"незакрытых пустых аккаунтов {len(r['empty'])} — рента заморожена")
-except Exception as e:
-    ПРОБЛЕМЫ.append(f"осмотр кошелька не удался: {type(e).__name__}")
+# --- 3. сироты: токены без позиции (бывают только в живом режиме) ---
+if ЖИВОЙ:
+    try:
+        r = orphans.scan()
+        if r["orphan"]:
+            ПРОБЛЕМЫ.append(f"СИРОТ {len(r['orphan'])} на ${r['orphan_usd']:.2f} — "
+                            f"токены без позиции: {', '.join(a['mint'][:10] for a in r['orphan'][:3])}")
+        if len(r["empty"]) > 5:
+            ПРОБЛЕМЫ.append(f"незакрытых пустых аккаунтов {len(r['empty'])} — рента заморожена")
+    except Exception as e:
+        ПРОБЛЕМЫ.append(f"осмотр кошелька не удался: {type(e).__name__}")
 
 # --- 4. сорванные сделки за последний час (счётчики пришли с хоста) ---
 сорвано_buy = int(os.environ.get("FAIL_BUY", 0))
@@ -73,9 +87,10 @@ if int(os.environ.get("TRACE", 0)):
 дублей = int(os.environ.get("DUP", 0))
 
 # --- 5. расхождение: реализованный PnL против фактического движения SOL ---
-# Главная проверка. Бумажный учёт и кошелёк обязаны сходиться; расхождение означает,
-# что бот считает не то, что происходит с деньгами.
-if sol is not None and было.get("sol") is not None and было.get("realized") is not None:
+# Главная проверка ЖИВОГО режима: учёт и кошелёк обязаны сходиться, расхождение
+# означает, что бот считает не то, что происходит с деньгами. В бумажном режиме
+# кошелёк заморожен, и сравнивать его с растущим счётчиком бессмысленно.
+if ЖИВОЙ and sol is not None and было.get("sol") is not None and было.get("realized") is not None:
     факт = sol - было["sol"]                       # сколько SOL реально прибавилось
     учёт_usd = rs["realized_usd"] - было["realized"]
     from src import market
@@ -92,10 +107,11 @@ json.dump({"sol": sol, "realized": rs["realized_usd"], "ts": now}, open(СОСТ
 
 метка = time.strftime("%Y-%m-%d %H:%M", time.gmtime())
 if ПРОБЛЕМЫ:
-    txt = f"КОНТРОЛЬ ЖИВОЙ ТОРГОВЛИ {метка} UTC\n" + "\n".join("• " + p for p in ПРОБЛЕМЫ)
+    txt = f"КОНТРОЛЬ · {РЕЖИМ} · {метка} UTC\n" + "\n".join("• " + p for p in ПРОБЛЕМЫ)
     print(txt)
     delivery.send_alert(txt)
 else:
-    print(f"{метка} всё сходится · {sol:.4f} SOL · день ${rs['realized_usd']:+.2f} "
+    кош = f"{sol:.4f} SOL" if sol is not None else "кошелёк недоступен"
+    print(f"{метка} [{РЕЖИМ}] всё сходится · {кош} · день ${rs['realized_usd']:+.2f} "
           f"· сделок {rs['n_trades']} · отложенных дублей выхода {дублей}")
 PYEOF

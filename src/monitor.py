@@ -357,9 +357,16 @@ async def run(max_mc: float, seconds: int | None) -> None:
         stats["exits"] += 1
         tripped = rm.on_close(net)
         if tripped:
-            await loop.run_in_executor(None, delivery.send_alert,
-                                       f"ТОРГОВЛЯ ОСТАНОВЛЕНА — {tripped['reason']}")
-            print(f"[RISK] СТОП: {tripped['reason']}")
+            # В shadow дневной стоп НЕ режет поток — он только помечает состояние.
+            # Кричать «ТОРГОВЛЯ ОСТАНОВЛЕНА», когда она продолжается, значит приучать
+            # владельца не верить алертам (правка 11.08: так и вышло на бумаге).
+            жёстко = strategy.RISK["RISK_MODE"] == "enforce"
+            текст = (f"ТОРГОВЛЯ ОСТАНОВЛЕНА — {tripped['reason']}" if жёстко else
+                     f"на бумаге сработал бы дневной стоп — {tripped['reason']} "
+                     f"(режим shadow: входы продолжаются)")
+            await loop.run_in_executor(None, delivery.send_alert, текст)
+            print(f"[RISK] {'СТОП' if жёстко else 'стоп (shadow, не режет)'}: "
+                  f"{tripped['reason']}")
         pm.close(token)
 
     async def on_event(wallet: str, sig: str, logs: list | None = None,
@@ -665,7 +672,11 @@ async def run(max_mc: float, seconds: int | None) -> None:
             if silence_h > strategy.ALERTS["STALE_SIGNAL_H"]:
                 problems.append(f"нет сигналов {silence_h:.1f}ч — поток иссяк / WS молчит?")
             if rm.state.halted:
-                problems.append(f"ТОРГОВЛЯ ОСТАНОВЛЕНА: {rm.state.halt_reason}")
+                problems.append(
+                    (f"ТОРГОВЛЯ ОСТАНОВЛЕНА: {rm.state.halt_reason}"
+                     if strategy.RISK["RISK_MODE"] == "enforce" else
+                     f"на бумаге сработал бы стоп: {rm.state.halt_reason} "
+                     f"(входы не блокируются)"))
             lg = ledger.reconcile()
             if not lg["ok"]:
                 problems.append(f"леджер: {lg['orphan_fills']} исполнений без намерений!")
