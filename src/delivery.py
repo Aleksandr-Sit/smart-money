@@ -188,8 +188,18 @@ def log_partial(pos, price: float | None, frac: float) -> None:
 
 
 def log_actor_buy(actor: str, wallet: str, token: str, usd: float, ts: float,
-                  converged: bool, n_actors: int) -> None:
+                  converged: bool, n_actors: int, price: float | None = None) -> None:
     """Лог КАЖДОЙ покупки watchlist-кошелька — сошлась она в сигнал или нет.
+
+    ЦЕНА ДОБАВЛЕНА 11.08 и это ключевое поле. Аудит входа показал, что каждый лишний
+    актор стоит денег: на 2901 токене, дошедшем до трёх акторов, вход на втором дал
+    +$7129 против −$1866 на третьем, а сам переход 2→3 занимает 29 секунд и делает
+    вход дороже на 8.4%. Логично, что вход по ПЕРВОМУ актору ещё дешевле — но
+    проверить это было нечем: трекер цены регистрирует токен только после того, как
+    сложился конфлюенс, а здесь цена не записывалась.
+    Теперь для любого токена, который потом сложится в сигнал, будет известна цена
+    его самой первой покупки — то есть станет измеримым единственный неизмеренный
+    вариант входа. Экстраполировать вместо замера на реальных деньгах нельзя.
 
     ЗАЧЕМ (аудит 10.08). До этого активность актора фиксировалась только когда он
     попадал в СИГНАЛ, то есть сходился с кем-то ещё в окне конфлюенса. Одиночные
@@ -203,7 +213,8 @@ def log_actor_buy(actor: str, wallet: str, token: str, usd: float, ts: float,
     """
     _append(config.OUTPUT_DIR / "actor_buys.jsonl",
             {"ts": ts, "actor": actor, "wallet": wallet, "token_mint": token,
-             "usd": round(usd, 2), "converged": converged, "n_actors": n_actors})
+             "usd": round(usd, 2), "price": price,
+             "converged": converged, "n_actors": n_actors})
 
 
 def log_actor_sell_any(token: str, actor: str, price: float | None, ts) -> None:
