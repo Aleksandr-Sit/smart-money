@@ -21,8 +21,22 @@ echo "=== $(date -u) старт автообновления ===" >> "$LOG"
 # discovery, и не шлёт ложное «приоритетный актор выбыл».
 cp output/flow_watchlist.json output/flow_watchlist_prev.json 2>/dev/null
 
-OUT=$(docker compose run --rm discovery 2>&1)
+# УБИРАЕМ ХВОСТЫ ПРЕДЫДУЩИХ ЗАПУСКОВ (найдено 12.08). Прогон discovery идёт больше
+# двадцати минут; если он подвис или его оборвали, контейнер остаётся жив и держит
+# блокировку файла DuckDB. Следующий недельный запуск падает на
+# «Conflicting lock is held», причём молча. Именно так автообновление не срабатывало ни разу.
+СТАРЫЕ=$(docker ps -q --filter "name=smart-money-discovery-run-")
+if [ -n "$СТАРЫЕ" ]; then
+  echo "убираю зависшие контейнеры discovery: $СТАРЫЕ" >> "$LOG"
+  docker rm -f $СТАРЫЕ >> "$LOG" 2>&1
+fi
+
+# Потолок по времени: подвисший прогон не должен дожить до следующей недели и
+# заблокировать её. 45 минут — вчетверо больше наблюдавшегося нормального прогона.
+OUT=$(timeout 2700 docker compose run --rm discovery 2>&1)
+КОД=$?
 echo "$OUT" >> "$LOG"
+[ "$КОД" = 124 ] && echo "ПРЕВЫШЕН ЛИМИТ 45 МИН — прогон оборван по таймауту" >> "$LOG"
 touch "$STAMP"
 
 if ! echo "$OUT" | grep -q REFRESH_OK; then

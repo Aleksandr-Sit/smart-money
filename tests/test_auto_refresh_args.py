@@ -76,3 +76,22 @@ def test_верхняя_граница_окна_отстаёт_на_срок_с�
     assert начало < конец, "окно должно быть непустым"
     отставание = (datetime.now(timezone.utc).replace(tzinfo=None) - конец).days
     assert отставание >= auto_refresh.MATURITY_DAYS - 1
+
+
+def test_провал_шага_печатается_в_stdout(monkeypatch, capsys):
+    """Причина отказа уходила ТОЛЬКО в Telegram, а крон-скрипт логирует stdout —
+    поэтому лог провала был пуст, и три недели было не видно, что мешает.
+    Настоящей причиной оказалась блокировка DuckDB живым контейнером discovery."""
+    import sys
+    from src import auto_refresh as ar
+
+    monkeypatch.setattr(ar, "credits_left", lambda: 9999)
+    monkeypatch.setattr(ar, "_run", lambda mod, margs: (False, "IO Error: Conflicting lock"))
+    monkeypatch.setattr(ar.delivery, "send_alert", lambda *a, **k: None)
+    monkeypatch.setattr(ar.delivery, "send_telegram", lambda *a, **k: None)
+    monkeypatch.setattr(ar, "_load", lambda p: {})
+    monkeypatch.setattr(sys, "argv", ["x", "--days", "30"])
+    ar.main()
+    вывод = capsys.readouterr().out
+    assert "ПРОВАЛ на шаге universe" in вывод
+    assert "Conflicting lock" in вывод, "текст ошибки обязан быть в логе, а не только в Telegram"
