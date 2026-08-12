@@ -26,7 +26,7 @@ _REQUIRED = {
     # Реальный потолок капитализации задаётся ключом --max-mc монитора.
     "signal": ["CONFLUENCE_N", "STRONG_CONFLUENCE_N", "CONFLUENCE_WINDOW_S",
                "SIGNAL_MIN_USD", "QUIET_MAX_USD"],
-    "entry": ["RULE", "PRIORITY_ACTORS"],
+    "entry": ["RULE", "PRIORITY_ACTORS", "MIN_INDEPENDENT"],
     "exit": ["PARTIAL_TAKES", "TP_MULT", "SL_MULT", "TRAIL", "TRAIL_ARM",
              "DEAD_AGE_H", "MAX_HOLD_S", "EXIT_ACTOR_FRAC"],
     "risk": ["MAX_POSITIONS", "EXIT_FEE", "BANKROLL_USD", "CLIP_USD",
@@ -77,6 +77,14 @@ def _validate(cfg: dict[str, Any]) -> None:
         raise ValueError(f"strategy.yaml: entry.RULE = {en['RULE']!r}, ожидается all|strong_or_priority")
     if en["RULE"] == "strong_or_priority" and not en["PRIORITY_ACTORS"]:
         raise ValueError("strategy.yaml: RULE=strong_or_priority, но PRIORITY_ACTORS пуст")
+    # 1 = фильтр независимости выключен. Выше CONFLUENCE_N требовать нельзя: сигнала
+    # с таким числом участников просто не бывает, и поток встал бы молча в ноль.
+    ми = en.get("MIN_INDEPENDENT", 1)
+    if not isinstance(ми, int) or ми < 1:
+        raise ValueError(f"strategy.yaml: entry.MIN_INDEPENDENT = {ми!r}, ожидается целое >= 1")
+    if ми > cfg["signal"]["CONFLUENCE_N"]:
+        raise ValueError(f"strategy.yaml: MIN_INDEPENDENT={ми} выше CONFLUENCE_N="
+                         f"{cfg['signal']['CONFLUENCE_N']} — поток остановится полностью")
     s = cfg["signal"]
     if s["CONFLUENCE_N"] > s["STRONG_CONFLUENCE_N"]:
         raise ValueError("strategy.yaml: CONFLUENCE_N > STRONG_CONFLUENCE_N")

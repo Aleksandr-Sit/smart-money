@@ -15,12 +15,39 @@ kill-switch НЕ блокирует вывод (убрать деньги со �
 """
 from __future__ import annotations
 
+import json
 import time
 
-from . import delivery, helius, ledger, market, strategy, wallet
+from . import config, delivery, helius, ledger, market, strategy, wallet
 
 _LAMPORTS = 1_000_000_000
-_last_sweep_ts = 0.0
+_ФАЙЛ_ПОСЛЕДНЕГО = "last_sweep.json"
+
+
+def _прочитать_последний() -> float:
+    """Время последнего вывода — ИЗ ФАЙЛА, а не из памяти процесса.
+
+    Переменная в памяти обнулялась при каждом перезапуске контейнера, а деплой
+    случается чаще, чем MIN_INTERVAL_S. Защита от частых выводов существовала
+    только на бумаге: после `up --build` интервал считался с нуля и следующий
+    вывод мог уйти сразу за предыдущим.
+    """
+    try:
+        with open(config.OUTPUT_DIR / _ФАЙЛ_ПОСЛЕДНЕГО, encoding="utf-8") as f:
+            return float(json.load(f).get("ts") or 0.0)
+    except Exception:  # noqa: BLE001 — нет файла = выводов ещё не было
+        return 0.0
+
+
+def _записать_последний(ts: float) -> None:
+    try:
+        config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = config.OUTPUT_DIR / (_ФАЙЛ_ПОСЛЕДНЕГО + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"ts": ts}, f)
+        tmp.replace(config.OUTPUT_DIR / _ФАЙЛ_ПОСЛЕДНЕГО)
+    except Exception as e:  # noqa: BLE001
+        print(f"[вывод] не удалось записать отметку времени: {type(e).__name__}")
 
 
 class SweepError(RuntimeError):
@@ -68,7 +95,6 @@ def plan(balance_sol: float | None = None) -> dict:
 
 def execute(dry_run: bool | None = None) -> dict:
     """Выполнить вывод по плану. dry_run=None → берётся из конфига (по умолчанию БЕЗОПАСНО)."""
-    global _last_sweep_ts
     cfg = strategy.SWEEP
     dry = cfg["DRY_RUN"] if dry_run is None else dry_run
 
@@ -77,7 +103,7 @@ def execute(dry_run: bool | None = None) -> dict:
     w = wallet.Wallet()
     if not w.available:
         return {"action": "skip", "reason": "кошелёк не подключён"}
-    since = time.time() - _last_sweep_ts
+    since = time.time() - _прочитать_последний()
     if since < cfg["MIN_INTERVAL_S"]:
         return {"action": "skip", "reason": f"интервал {since:.0f}с < {cfg['MIN_INTERVAL_S']}с"}
 
@@ -97,7 +123,7 @@ def execute(dry_run: bool | None = None) -> dict:
         return {**p, "action": "dry_run", "destination": str(dest), "intent": iid}
 
     sig = _send_transfer(w, dest, lamports)
-    _last_sweep_ts = time.time()
+    _записать_последний(time.time())
     ledger.record_fill(iid, "SOL", p["sol_usd"], usd=p["amount_usd"], signature=sig,
                        mode="live", extra={"destination": str(dest)})
     delivery.send_alert(f"ВЫВОД ${p['amount_usd']:.2f} на холодный кошелёк · tx {sig[:16]}…")
@@ -139,8 +165,19 @@ def status() -> str:
     p = plan()
     cfg = strategy.SWEEP
     mode = "DRY-RUN" if cfg["DRY_RUN"] else "LIVE"
+    # ПОКАЗЫВАЕМ И SOL, И ДОЛЛАРЫ. Кошелёк номинирован в SOL, а пороги заданы в
+    # долларах: при движении курса баланс «пересекает» порог без единой сделки,
+    # и по одной строке в долларах это неотличимо от заработка.
+    bal_usd = p.get("balance_usd")
+    sol_usd = market.sol_price()
+    баланс = ("н/д" if bal_usd is None or not sol_usd
+              else f"{bal_usd / sol_usd:.4f} SOL (${bal_usd:.2f} по курсу ${sol_usd:.0f})")
+    посл = _прочитать_последний()
+    когда = ("выводов не было" if not посл
+             else f"последний вывод {(time.time() - посл) / 3600:.1f}ч назад")
     return (f"вывод [{mode}, {'вкл' if cfg['ENABLED'] else 'выкл'}] → {dest_s} · "
-            f"порог ${cfg['SWEEP_TRIGGER_USD']}, шаг ${cfg['SWEEP_MIN_USD']} · {p.get('reason', p['action'])}")
+            f"баланс {баланс} · порог ${cfg['SWEEP_TRIGGER_USD']}, шаг ${cfg['SWEEP_MIN_USD']} · "
+            f"{когда} · {p.get('reason', p['action'])}")
 
 
 if __name__ == "__main__":

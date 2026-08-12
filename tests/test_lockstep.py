@@ -165,3 +165,37 @@ def test_независимых_без_связок_равно_числу_кош
     """Пока файла связок нет, поле обязано совпадать с n_actors — иначе отчётность
     начнёт расходиться с правилом входа без единой правки конфига."""
     assert ls.независимых(["A", "B"], {}) == 2
+
+
+def test_фильтр_независимости_режет_ложный_конфлюенс(monkeypatch):
+    """Включено 12.08 по A/B: +$167/сут против +$144, 4/4 отрезка, 88% потока."""
+    from src import monitor, strategy
+
+    class _S:
+        actors = ("A", "B")
+        level = "weak"
+    monkeypatch.setitem(strategy.ENTRY, "MIN_INDEPENDENT", 2)
+    ok, why = monitor.tradable(_S(), независимых=1)
+    assert ok is False and "независимого подтверждения" in why
+    assert monitor.tradable(_S(), независимых=2)[0] is True
+
+
+def test_без_данных_о_связках_фильтр_молчит(monkeypatch):
+    """Нет файла lockstep.json → независимых=None → отбор не меняется.
+    Отсутствие данных не имеет права тихо останавливать поток."""
+    from src import monitor, strategy
+
+    class _S:
+        actors = ("A", "B")
+        level = "weak"
+    monkeypatch.setitem(strategy.ENTRY, "MIN_INDEPENDENT", 2)
+    assert monitor.tradable(_S(), независимых=None)[0] is True
+
+
+def test_порог_выше_конфлюенса_не_проходит_валидацию():
+    """MIN_INDEPENDENT > CONFLUENCE_N остановил бы поток полностью и молча."""
+    from src import strategy
+    cfg = strategy.load()
+    cfg["entry"]["MIN_INDEPENDENT"] = cfg["signal"]["CONFLUENCE_N"] + 1
+    with pytest.raises(ValueError, match="поток остановится"):
+        strategy._validate(cfg)

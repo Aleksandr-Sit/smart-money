@@ -15,9 +15,9 @@ import json
 import time
 from collections import Counter, deque
 
-from . import (config, delivery, execution, helius, helius_ws, ledger, lockstep, market, orphans,
-               positions, price_track, log_parse, reachable, risk, safety, strategy, swap, sweep,
-               tx_parse)
+from . import (commands, config, delivery, execution, helius, helius_ws, ledger, lockstep, market,
+               orphans, positions, price_track, log_parse, reachable, risk, safety, strategy, swap,
+               sweep, tx_parse)
 from . import wallet as hot_wallet   # псевдоним: в on_event параметр называется wallet
 from .signal_engine import BuyEvent, SignalEngine, load_actor_map
 
@@ -30,7 +30,7 @@ SWEEP_POLL_S = 600         # как часто проверять, не пора
 PRIORITY = set(strategy.ENTRY["PRIORITY_ACTORS"])
 
 
-def tradable(signal) -> tuple[bool, str]:
+def tradable(signal, независимых: int | None = None) -> tuple[bool, str]:
     """Правило входа. Сейчас "all" — торгуем каждый сигнал (аудит 07.08).
 
     Правило "strong_or_priority" действовало до 07.08 и опиралось на вывод аудита-7,
@@ -48,6 +48,14 @@ def tradable(signal) -> tuple[bool, str]:
     владельцем: пересматривать каждые 72 часа, при ухудшении откатываться на
     "приоритетные ИЛИ объём 500–3000$" (пока не вынесено в конфиг как отдельный режим).
     """
+    # НЕЗАВИСИМОЕ ПОДТВЕРЖДЕНИЕ (12.08). Проверяется ДО правила RULE: сигнал, который
+    # целиком собрал один участник несколькими кошельками, не является конфлюенсом ни
+    # при каком RULE. A/B на 10 188 сделках: +$167/сут против +$144 у прежнего "all",
+    # 4/4 отрезка, сохраняется 88% потока. `None` = связки неизвестны (нет файла) —
+    # тогда фильтр молчит, отсутствие данных не должно менять отбор.
+    мин = strategy.ENTRY.get("MIN_INDEPENDENT", 1)
+    if мин > 1 and независимых is not None and независимых < мин:
+        return False, f"нет независимого подтверждения ({независимых} участник)"
     if strategy.ENTRY["RULE"] == "all":
         return True, "all"
     has_priority = bool(PRIORITY & set(signal.actors))
@@ -106,7 +114,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
     pos_intent: dict[str, str] = {}       # token -> id намерения в леджере
     stats = {"signals": 0, "strong": 0, "quiet": 0, "alerts": 0, "opens": 0, "exits": 0,
              "skipped_unsellable": 0, "skipped_rule": 0, "from_logs": 0, "from_rpc": 0,
-             "stale_slots": 0, "fake_confluence": 0,
+             "stale_slots": 0, "fake_confluence": 0, "skipped_paused": 0,
              "started": time.time(), "last_signal_ts": time.time()}
     loop = asyncio.get_event_loop()
     # Связки кошельков одного участника. Файл готовит отдельная задача по расписанию —
@@ -522,7 +530,15 @@ async def run(max_mc: float, seconds: int | None) -> None:
             stats["alerts"] += 1
         # капитал-лимит: бот держит ≤MAX_POSITIONS слотов (replay: 3-5 = edge без потерь,
         # медиана удержания 5.9 мин → низкая конкуренция). Реализм: не открываем сверх лимита.
-        ok_rule, rule_why = tradable(signal)
+        # ПАУЗА ПО КОМАНДЕ ВЛАДЕЛЬЦА (/стоп из Telegram). Проверяется здесь, а не в
+        # tradable: остановка входов — это не свойство сигнала, и путать её с правилом
+        # отбора нельзя, иначе в статистике «отвергнуто правилом» окажется то, что
+        # правило приняло бы. Открытые позиции продолжают жить и выходят штатно.
+        if commands.на_паузе():
+            stats["skipped_paused"] += 1
+            print(f"[ПАУЗА] пропуск {token[:12]}: входы остановлены владельцем")
+            return
+        ok_rule, rule_why = tradable(signal, незав)
         if not ok_rule:
             stats["skipped_rule"] += 1
             print(f"[RULE] пропуск {token[:12]}: {rule_why}")
@@ -665,6 +681,35 @@ async def run(max_mc: float, seconds: int | None) -> None:
                            + ", ".join(x["mint"][:10] for x in r["failed"][:5])
                 print(f"[orphans] {msg}", flush=True)
                 await loop.run_in_executor(None, delivery.send_alert, msg)
+
+    async def command_loop() -> None:
+        """Приём команд из Telegram. Длинный опрос: одно висящее соединение.
+
+        Каждый ответ собирается ЗДЕСЬ, а не в commands.py: модуль команд не должен
+        знать про позиции, риск и кошелёк — иначе его не проверить без всей системы.
+        """
+        обработчики = {
+            "статус": lambda: (
+                f"{'⏸ ВХОДЫ ОСТАНОВЛЕНЫ' if commands.на_паузе() else '▶️ входы разрешены'} · "
+                f"{'ЖИВЫЕ ДЕНЬГИ' if LIVE else 'бумага'} · v{strategy.VERSION}\n"
+                f"открытых позиций: {len(pm.open_tokens())} из {MAX_POSITIONS}\n"
+                f"сигналов за смену: {stats['signals']} "
+                f"(без незав.подтв. {stats['fake_confluence']}, "
+                f"отвергнуто правилом {stats['skipped_rule']})\n"
+                f"входов {stats['opens']} · выходов {stats['exits']}\n"
+                f"РИСК: {rm.status()}"),
+            "баланс": lambda: hot_wallet.status(),
+        }
+        offset = None
+        while True:
+            try:
+                offset, настроен = await loop.run_in_executor(
+                    None, commands.опросить, обработчики, offset)
+                if not настроен:            # Telegram не настроен — петля бессмысленна
+                    return
+            except Exception as e:  # noqa: BLE001 — приём команд не роняет торговлю
+                print(f"[команды] сбой петли: {type(e).__name__}")
+                await asyncio.sleep(30)
 
     async def heartbeat() -> None:
         def _rpc_alive() -> str:
@@ -825,6 +870,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
     tasks.append(asyncio.create_task(heartbeat()))
     tasks.append(asyncio.create_task(sweep_loop()))
     tasks.append(asyncio.create_task(orphan_loop()))
+    tasks.append(asyncio.create_task(command_loop()))
     if seconds:
         await asyncio.sleep(seconds)
         for t in tasks:

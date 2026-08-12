@@ -13,12 +13,15 @@ HOT = "So11111111111111111111111111111111111111112"
 
 
 @pytest.fixture
-def cfg(monkeypatch):
+def cfg(monkeypatch, tmp_path):
     """Настроенный вывод с валидным адресом."""
     c = {**strategy.SWEEP, "ENABLED": True, "DRY_RUN": True, "SWEEP_ADDRESS": COLD}
     monkeypatch.setattr(strategy, "SWEEP", c)
     monkeypatch.setattr(sweep.strategy, "SWEEP", c)
-    sweep._last_sweep_ts = 0.0
+    # отметка времени переехала из памяти процесса в файл (правка 12.08): переменная
+    # обнулялась каждым пересозданием контейнера, и защита от частых выводов
+    # существовала только на бумаге
+    monkeypatch.setattr(sweep.config, "OUTPUT_DIR", tmp_path)
     return c
 
 
@@ -114,7 +117,7 @@ def test_интервал_между_выводами(cfg, monkeypatch):
     """Защита от цикла: два вывода подряд невозможны."""
     import time
     monkeypatch.setattr(sweep.wallet.Wallet, "available", property(lambda self: True))
-    sweep._last_sweep_ts = time.time()
+    sweep._записать_последний(time.time())
     r = sweep.execute()
     assert r["action"] == "skip" and "интервал" in r["reason"]
 
