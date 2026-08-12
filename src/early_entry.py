@@ -22,11 +22,9 @@ Run:  python -m src.early_entry [--горизонт 300]
 from __future__ import annotations
 
 import argparse
-import json
 import statistics as st
-from collections import defaultdict
 
-from . import analysis, config
+from . import analysis
 
 CLIP = 10.0
 # измерено 10.08 на 179 живых сделках: вход тем дороже, чем больше купили до нас
@@ -42,23 +40,14 @@ def хайркат(объём: float) -> float:
 
 
 def _траектории(нужны: set[str]) -> dict[str, list[tuple[float, float]]]:
-    трек: dict[str, list] = defaultdict(list)
-    p = config.OUTPUT_DIR / "price_history.jsonl"
-    if not p.exists():
-        return трек
-    with open(p, encoding="utf-8") as f:
-        for ln in f:
-            if '"mint"' not in ln:
-                continue
-            try:
-                r = json.loads(ln)
-            except Exception:  # noqa: BLE001
-                continue
-            if r.get("mint") in нужны and r.get("price_usd"):
-                трек[r["mint"]].append((r["ts"], r["price_usd"]))
-    for v in трек.values():
-        v.sort()
-    return трек
+    """Траектории СО СКЛЕЙКОЙ шкалы (правка 11.08).
+
+    Раньше читались сырыми, а на стыке кривая→DEX цена прыгает с медианой 1.1464 при
+    контроле ровно 1.0000 внутри каждого источника. Грэдуируют именно победители,
+    поэтому артефакт садился ровно на те сделки, которые решают исход замера.
+    """
+    трек = analysis.траектории(нужны)
+    return {m: [(ts, цена) for ts, цена, _ in v] for m, v in трек.items()}
 
 
 def собрать(горизонт: float = 300.0) -> dict:

@@ -15,8 +15,9 @@ import json
 import time
 from collections import Counter, deque
 
-from . import (config, delivery, execution, helius, helius_ws, ledger, market, orphans, positions,
-               price_track, log_parse, risk, safety, strategy, swap, sweep, tx_parse)
+from . import (config, delivery, execution, helius, helius_ws, ledger, lockstep, market, orphans,
+               positions, price_track, log_parse, reachable, risk, safety, strategy, swap, sweep,
+               tx_parse)
 from . import wallet as hot_wallet   # псевдоним: в on_event параметр называется wallet
 from .signal_engine import BuyEvent, SignalEngine, load_actor_map
 
@@ -105,9 +106,16 @@ async def run(max_mc: float, seconds: int | None) -> None:
     pos_intent: dict[str, str] = {}       # token -> id намерения в леджере
     stats = {"signals": 0, "strong": 0, "quiet": 0, "alerts": 0, "opens": 0, "exits": 0,
              "skipped_unsellable": 0, "skipped_rule": 0, "from_logs": 0, "from_rpc": 0,
-             "stale_slots": 0,
+             "stale_slots": 0, "fake_confluence": 0,
              "started": time.time(), "last_signal_ts": time.time()}
     loop = asyncio.get_event_loop()
+    # Связки кошельков одного участника. Файл готовит отдельная задача по расписанию —
+    # считать его в торговом процессе нельзя, это разбор 15 МБ журналов. Нет файла =
+    # каждый кошелёк сам за себя, то есть прежнее поведение.
+    связки = lockstep.загрузить()
+    if связки:
+        print(f"[связки] загружено {len(связки)} кошельков в "
+              f"{len(set(связки.values()))} группах", flush=True)
     # Аномалии цены по источнику. Одно число на все пути было бесполезно: у каждого своя
     # нормальная частота, и общий порог либо молчит на поломке, либо кричит на норме.
     anom_src: Counter = Counter()
@@ -349,8 +357,14 @@ async def run(max_mc: float, seconds: int | None) -> None:
         итог = факт if факт is not None else r
         net = итог - (0.0 if факт is not None else strategy.RISK["EXIT_FEE"])
         разрыв = (факт - r) if факт is not None else None
+        # В `realized_actual` идёт ФАКТ, а не `итог`. Раньше передавался `итог`, а он в
+        # бумажном режиме равен модели — и запись уходила помеченной `pnl_source: "деньги"`
+        # с пропуском вычета EXIT_FEE. То есть весь бумажный журнал был завышен на 12% и
+        # выглядел измеренным по деньгам (найдено 11.08). В живом режиме поведение не
+        # меняется: там `итог` и есть `факт`. Когда замер сломан, `факт` уже обнулён выше,
+        # и запись честно помечается моделью — ровно то, что обещает алерт.
         await loop.run_in_executor(None, delivery.deliver_exit, p, exit_price, reason, True,
-                                   итог, разрыв)
+                                   факт, разрыв)
         print(f"[EXIT {reason}] {token} realized={итог:+.0%}"
               + (f" (модель {r:+.0%}, разрыв {разрыв:+.1%})" if разрыв is not None else "")
               + (' [ЦЕНА УСТАРЕЛА]' if stale else ''))
@@ -485,7 +499,18 @@ async def run(max_mc: float, seconds: int | None) -> None:
         # когорта (медиана +68%). Теперь алертим всё торгуемое с приемлемым safety.
         alert = (saf.get("verdict") in ("ok", "warn")
                  and (signal.quiet or quality or bool(PRIORITY & set(signal.actors))))
-        await loop.run_in_executor(None, delivery.deliver, signal, saf, info, True, alert)
+        # СКОЛЬКО НЕЗАВИСИМЫХ УЧАСТНИКОВ (11.08). Один участник держит несколько
+        # кошельков и в одиночку закрывает порог CONFLUENCE_N=2 — так возникали 12.3%
+        # сигналов без подтверждения вовсе. Пока только считаем и пишем: правило входа
+        # не меняется, изменение отбора требует отдельного A/B.
+        незав = lockstep.независимых(signal.actors, связки)
+        if незав < 2:
+            stats["fake_confluence"] += 1
+        await loop.run_in_executor(None, delivery.deliver, signal, saf, info, True,
+                                   alert, незав)
+        # ЗАМЕР ДОСТИЖИМОЙ ЦЕНЫ — фоном, путь до входа не удлиняет (см. src/reachable.py)
+        reachable.запустить(token, info.get("price_usd"), независимых=незав,
+                            объём=signal.window_usd, n_actors=signal.n_actors)
         stats["signals"] += 1
         stats["last_signal_ts"] = time.time()
         _touch_actors(signal.actors)      # для алерта «поток иссяк»
@@ -659,7 +684,13 @@ async def run(max_mc: float, seconds: int | None) -> None:
             Из-за этого watchlist протух до 28.8 дней при пороге 7, и никто не узнал.
             Проверки молчат, когда всё в порядке, поэтому частый вызов не спамит.
             """
-            nonlocal prev_anom
+            nonlocal prev_anom, связки
+            # перечитываем связки: файл обновляет отдельная задача по расписанию,
+            # без перечитывания монитор жил бы со снимком на момент старта
+            новые = lockstep.загрузить()
+            if новые != связки:
+                print(f"[связки] обновлены: {len(новые)} кошельков", flush=True)
+                связки = новые
             problems = []
             new_anom = tracker.anomalies - prev_anom
             prev_anom = tracker.anomalies
@@ -698,9 +729,11 @@ async def run(max_mc: float, seconds: int | None) -> None:
             await asyncio.sleep(HEARTBEAT_S)
             up_h = (time.time() - stats["started"]) / 3600
             msg = (f"жив {up_h:.0f}ч · v{strategy.VERSION} · сигналов={stats['signals']} "
-                   f"(strong={stats['strong']} тихих={stats['quiet']} алертов={stats['alerts']}) · "
+                   f"(strong={stats['strong']} тихих={stats['quiet']} алертов={stats['alerts']} "
+                   f"без незав.подтв.={stats['fake_confluence']}) · "
                    f"входов={stats['opens']} выходов={stats['exits']} · открытых={len(pm.open_tokens())} · "
                    f"трек={len(tracker.active)} · аном={tracker.anomalies} · "
+                   f"замер цены: сбои {reachable.сбои_текстом()} · "
                    f"непродаваемых={stats['skipped_unsellable']} правилом={stats['skipped_rule']} "
                    f"протухших={stats['stale_slots']} · "
                    f"сделок из логов={stats['from_logs']} через RPC={stats['from_rpc']} "

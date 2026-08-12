@@ -11,7 +11,7 @@ import json
 import statistics
 from collections import defaultdict
 
-from . import config, market
+from . import analysis, config, market
 
 
 def _load(name: str) -> list[dict]:
@@ -22,16 +22,29 @@ def _load(name: str) -> list[dict]:
 
 
 def main() -> None:
-    closed = [c for c in _load("paper_closed.jsonl") if c.get("realized_pnl") is not None]
+    # ЧЕРЕЗ analysis.load_closed, а не своим чтением (правка 11.08). Прямое чтение
+    # `realized_pnl` обходило две защиты сразу: отсечку аномалий (в журнале лежат 18
+    # исторических записей с невозможной ценой выхода, одна на +12 832 014 201) и вычет
+    # комиссии. Первая раздувала среднее до сотен миллионов процентов, вторая завышала
+    # каждую сделку на EXIT_FEE. Поле `pnl` уже net и уже с учётом источника итога.
+    closed = analysis.load_closed()
+    сырых = sum(1 for r in _load("paper_closed.jsonl") if r.get("realized_pnl") is not None)
     print(f"=== ЗАКРЫТЫЕ round-trip (реализованные): {len(closed)} ===")
+    if сырых != len(closed):
+        print(f"    отсеяно аномальных/без даты входа: {сырых - len(closed)} из {сырых}")
     if closed:
-        rets = [c["realized_pnl"] for c in closed]
+        rets = [c["pnl"] for c in closed]
         wins = sum(1 for x in rets if x > 0)
+        # по полю `по_деньгам`, а НЕ по метке `pnl_source`: метка до правки 11.08
+        # ставилась каждому бумажному выходу, и счёт по ней давал 1644 «денежных»
+        # сделки при 188 действительно живых
+        деньги = sum(1 for c in closed if c.get("по_деньгам"))
         print(f"win-rate: {wins/len(closed):.2f} | median: {statistics.median(rets):+.1%} | "
               f"mean: {statistics.mean(rets):+.1%} | сумма: {sum(rets):+.1%}")
+        print(f"итог по деньгам: {деньги} сделок, по модели: {len(closed)-деньги}")
         by = defaultdict(list)
         for c in closed:
-            by[c.get("reason", "?")].append(c["realized_pnl"])
+            by[c.get("reason", "?")].append(c["pnl"])
         print("по причине выхода:")
         for reason, rr in sorted(by.items(), key=lambda kv: -len(kv[1])):
             w = sum(1 for x in rr if x > 0)

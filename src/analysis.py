@@ -50,6 +50,73 @@ def is_sane_pnl(value) -> bool:
     return isinstance(value, (int, float)) and abs(value) <= MAX_ABS_PNL
 
 
+def склеить(точки: list[tuple]) -> list[tuple]:
+    """Привести траекторию к ОДНОЙ шкале на стыке источников цены.
+
+    ЗАЧЕМ (замер 11.08 на 1 756 276 выборках). Трекер читает цену с бондинг-кривой,
+    а после выпуска токена на DEX переключается на DexScreener. На стыке цена прыгает,
+    хотя рынок не двинулся:
+
+        curve→curve  n=1 180 538  медиана 1.0000   <- контроль
+        dex→dex      n=  553 041  медиана 1.0000   <- контроль
+        curve→dex    n=    1 599  медиана 1.1464   максимум 59.9
+
+    Контроль внутри каждого источника — ровно единица, значит 14.6% на стыке это
+    шкала, а не движение цены. Бьёт по лучшим сделкам: грэдуируют как раз победители,
+    и шесть из десяти крупнейших результатов схлопывались с +1000…+3500% до нуля.
+
+    Склейка домножает последующий отрезок так, чтобы первая выборка нового источника
+    совпала с последней выборкой прежнего. Переход `signal`→`curve` НЕ склеивается:
+    якорь `signal` — это цена актора, а расхождение с ней есть настоящий разрыв
+    исполнения (медиана 0.9452), и гасить его склейкой значило бы прятать проблему.
+
+    точки — [(ts, price, src), ...] по возрастанию ts. → тот же список с новой ценой.
+    """
+    из: list[tuple] = []
+    k = 1.0
+    пред = None
+    for ts, цена, src in точки:
+        if (пред is not None and {src, пред[2]} == {"curve", "dex"}
+                and пред[1] > 0 and цена > 0):
+            k *= пред[1] / цена
+        из.append((ts, цена * k, src))
+        пред = (ts, цена, src)
+    return из
+
+
+def траектории(нужны: set[str] | None = None, directory: Path | None = None,
+               splice: bool = True) -> dict[str, list[tuple]]:
+    """Траектории из price_history.jsonl → {mint: [(ts, price, src), ...]}.
+
+    splice=True (по умолчанию) приводит каждую траекторию к одной шкале. Отключать
+    только для замера самого артефакта — во всех остальных случаях сырые ряды дают
+    завышенный результат на грэдуировавших токенах.
+    """
+    трек: dict[str, list[tuple]] = {}
+    path = (directory or config.OUTPUT_DIR) / "price_history.jsonl"
+    if not path.exists():
+        return трек
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if '"price_usd"' not in line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            m, p = r.get("mint"), r.get("price_usd")
+            if not m or not p or p <= 0:
+                continue
+            if нужны is not None and m not in нужны:
+                continue
+            трек.setdefault(m, []).append((float(r["ts"]), float(p), r.get("src")))
+    for m, v in трек.items():
+        v.sort()
+        if splice:
+            трек[m] = склеить(v)
+    return трек
+
+
 def load_closed(directory: Path | None = None, with_fee: bool = True,
                 since: float | None = None, until: float | None = None) -> list[dict]:
     """Закрытые позиции с отсечкой аномалий и приведённым PnL.
@@ -58,6 +125,11 @@ def load_closed(directory: Path | None = None, with_fee: bool = True,
     net отдельно. Забыть об этом — значит завысить результат на 6% на каждой сделке.
     since/until — границы по entry_ts, чтобы исключать окна с известным дефектом кода.
     → список записей с добавленными полями pnl (net) и exit_ts.
+
+    ИСКЛЮЧЕНИЕ (найдено 11.08): у записей с `pnl_source == "деньги"` комиссии УЖЕ внутри
+    полученной суммы — она посчитана по дельтам транзакций. Вычитать EXIT_FEE ещё раз
+    значит занижать живые сделки на 12%, то есть ровно на ту величину, вокруг которой
+    идёт весь спор о доходности. Комиссия вычитается только из модельного результата.
     """
     from . import strategy
     fee = strategy.RISK["EXIT_FEE"] if with_fee else 0.0
@@ -78,7 +150,14 @@ def load_closed(directory: Path | None = None, with_fee: bool = True,
             exit_ts = datetime.fromisoformat(r["ts"]).timestamp()
         except Exception:  # noqa: BLE001
             continue
-        out.append({**r, "pnl": r["realized_pnl"] - fee, "exit_ts": exit_ts})
+        # Нужны ОБА признака. Метка `pnl_source` до правки 11.08 ставилась неверно:
+        # монитор передавал модельный итог в параметр «фактические деньги», и все
+        # бумажные выходы с 10.08 помечены «деньгами». Доверять одной метке — значит
+        # не вычесть комиссию из целого пласта бумажной истории. Реальные деньги
+        # бывают только в живом режиме, поэтому решает пара «mode + источник».
+        по_деньгам = r.get("pnl_source") == "деньги" and r.get("mode") == "live"
+        out.append({**r, "pnl": r["realized_pnl"] - (0.0 if по_деньгам else fee),
+                    "exit_ts": exit_ts, "по_деньгам": по_деньгам})
     out.sort(key=lambda x: x["exit_ts"])
     return out
 

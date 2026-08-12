@@ -85,12 +85,21 @@ def send_telegram(text: str) -> bool:
 
 
 def deliver(sig: Signal, safety: dict, info: dict | None = None,
-            paper: bool = True, telegram: bool = True) -> None:
+            paper: bool = True, telegram: bool = True,
+            независимых: int | None = None) -> None:
+    """`независимых` — сколько РАЗНЫХ участников стоит за сигналом (см. `lockstep`).
+
+    Замер 11.08: `n_actors` завышает подтверждение, потому что один участник держит
+    несколько кошельков и в одиночку закрывает порог CONFLUENCE_N=2. Так возникали
+    12.3% сигналов вообще без независимого подтверждения. Пишем поле в журнал, чтобы
+    разделение считалось по факту, а не восстанавливалось задним числом.
+    """
     now = datetime.now(timezone.utc).isoformat()
     info = info or {}
     rec = {"ts": now, "strategy_version": strategy.VERSION,   # каким конфигом порождён сигнал
            "signal": asdict(sig), "safety_verdict": safety.get("verdict"),
-           "risks": safety.get("risks"), "insider": safety.get("insider"), "market": info}
+           "risks": safety.get("risks"), "insider": safety.get("insider"), "market": info,
+           "независимых": независимых}
     _append(config.OUTPUT_DIR / "signals.log", rec)          # лог ВСЕГДА (для анализа)
     if paper and safety.get("verdict") != "danger":          # PAPER не входим в danger
         _append(config.OUTPUT_DIR / "paper_positions.jsonl",
