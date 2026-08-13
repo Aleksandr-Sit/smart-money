@@ -120,7 +120,8 @@ _REASON_TXT = {"actors_exit": "акторы вышли", "take_profit": "тей�
 
 
 def format_exit(pos, exit_price: float, reason: str, realized_pnl: float,
-                модель: float | None = None, разрыв: float | None = None) -> str:
+                модель: float | None = None, разрыв: float | None = None,
+                разрыв_к: float | None = None) -> str:
     """Сообщение о выходе. Включает параметры ВХОДА намеренно.
 
     С 07.08 правило входа "all" — торгуем каждый сигнал, но уведомления о входе
@@ -156,8 +157,11 @@ def format_exit(pos, exit_price: float, reason: str, realized_pnl: float,
         f"вышло акторов: {len(pos.exited_actors)}/{len(pos.entry_actors)}",
     ]
     if по_деньгам:
-        lines.append(f"модель дала бы {(модель if модель is not None else 0):+.0%} · "
-                     f"РАЗРЫВ ИСПОЛНЕНИЯ {разрыв:+.0%}")
+        # Доля модели, дошедшая до кошелька, вместо разницы доходностей: на крупной
+        # сделке разница даёт нечитаемые сотни процентов (см. `разрыв_к` в monitor).
+        к = (f"до нас дошло {разрыв_к:.0%} от модели" if разрыв_к is not None
+             else f"РАЗРЫВ ИСПОЛНЕНИЯ {разрыв:+.0%}")
+        lines.append(f"модель дала бы {(модель if модель is not None else 0):+.0%} · {к}")
     lines += [
         f"цены АКТОРА (нам недоступны): вход MC {_fmt_usd(pos.entry_mc)} → "
         f"выход MC ~{_fmt_usd((exit_price or 0) * 1_000_000_000)}, {_x(exit_price)}",
@@ -169,7 +173,8 @@ def format_exit(pos, exit_price: float, reason: str, realized_pnl: float,
 
 def deliver_exit(pos, exit_price: float, reason: str, telegram: bool = True,
                  realized_actual: float | None = None,
-                 exec_gap: float | None = None) -> None:
+                 exec_gap: float | None = None,
+                 разрыв_к: float | None = None) -> None:
     """realized_actual — итог ПО ДЕНЬГАМ (живой режим). Если задан, он и есть правда.
 
     Модельный результат при этом сохраняется отдельным полем: сравнение двух чисел —
@@ -196,7 +201,13 @@ def deliver_exit(pos, exit_price: float, reason: str, telegram: bool = True,
            # издержек и движения рынка).
            "entry_price": pos.entry_price, "exit_price": exit_price,
            "цены_источник": "актор", "realized_pnl": realized,
-           "realized_model": model, "exec_gap": exec_gap,
+           # exec_gap оставлен арифметическим ради сопоставимости с уже накопленным
+           # журналом; читать и считать окупаемость следует по `разрыв_к`.
+           "realized_model": model, "exec_gap": exec_gap, "разрыв_к": разрыв_к,
+           # ДЛИТЕЛЬНОСТЬ УДЕРЖАНИЯ. Поле `held_s` спрашивал каждый разбор выхода и не
+           # находил ни в одной из 178 живых записей — его никто не писал, и время
+           # приходилось восстанавливать вычитанием из `ts`, теряя записи с битым `ts`.
+           "held_s": (round(time.time() - pos.entry_ts, 1) if pos.entry_ts else None),
            "pnl_source": "деньги" if realized_actual is not None else "модель",
            "realized_net": realized_net, "realized_partial": pos.realized, "remaining": pos.remaining,
            "entry_actors": len(pos.entry_actors), "exited_actors": len(pos.exited_actors),
@@ -206,7 +217,7 @@ def deliver_exit(pos, exit_price: float, reason: str, telegram: bool = True,
     if telegram:
         send_telegram(format_exit(pos, exit_price, reason,
                                   realized if realized is not None else 0.0,
-                                  модель=model, разрыв=exec_gap))
+                                  модель=model, разрыв=exec_gap, разрыв_к=разрыв_к))
 
 
 def log_partial(pos, price: float | None, frac: float) -> None:

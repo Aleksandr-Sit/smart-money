@@ -139,6 +139,14 @@ def load_closed(directory: Path | None = None, with_fee: bool = True,
             continue
         if not is_sane_pnl(r.get("realized_pnl")):
             continue
+        # ПОЛ −100% ДЛЯ ЗАПИСЕЙ ПО ДЕНЬГАМ. Купив токен на клип, потерять больше клипа
+        # нельзя: значение ниже — сломанный замер выручки, а не убыток. Монитор отбивает
+        # такие с 11.08, но в журнале осталось две записи от 10.08 (−200.1% и −102.7%),
+        # и `is_sane_pnl` их пропускал: он смотрит только на |PnL| ≤ 20. Ценой этого
+        # были 19% всего живого убытка в разборе 13.08 — из двух записей, которых
+        # не должно было быть.
+        if r.get("pnl_source") == "деньги" and r.get("realized_pnl", 0) < -1.0:
+            continue
         ets = r.get("entry_ts")
         if ets is None:
             continue
