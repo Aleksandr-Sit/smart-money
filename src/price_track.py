@@ -112,7 +112,7 @@ class PriceTracker:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def register(self, mint: str, price0: float | None, ts: float | None = None,
-                 renew: bool = False) -> None:
+                 renew: bool = False, ttl: float | None = None) -> None:
         """renew=True — перерегистрация с ТЕКУЩЕГО момента (после рестарта монитора).
 
         Без этого открытые позиции после перезапуска оставались без цен: трекер их не вёл,
@@ -122,14 +122,18 @@ class PriceTracker:
         if mint in self.active and not renew:
             return
         t0 = time.time() if renew else (ts or time.time())
-        self.active[mint] = {"pda": bonding_curve_pda(mint), "t0": t0}
+        # ttl — срок наблюдения ИМЕННО ЭТОГО токена. Нужен для несошедшихся покупок
+        # (12.08): их ведём коротко, только чтобы измерить раннюю траекторию, и не
+        # раздуваем price_history вчетверо ради данных, которые нужны на десять минут.
+        self.active[mint] = {"pda": bonding_curve_pda(mint), "t0": t0, "ttl": ttl}
         if price0 and not renew:              # якорь t0 — цена он-чейн покупки из сигнала
             self._append({"ts": t0, "mint": mint, "price_usd": price0, "src": "signal"})
 
     def _poll_once(self) -> list[dict]:
         """Синхронный опрос (зовётся из executor): один батч по всем активным."""
         now = time.time()
-        for m in [m for m, st in self.active.items() if now - st["t0"] > TRACK_S]:
+        for m in [m for m, st in self.active.items()
+                  if now - st["t0"] > (st.get("ttl") or TRACK_S)]:
             del self.active[m]
         if not self.active:
             return []

@@ -28,6 +28,10 @@ MAX_EVENT_AGE_S = 300      # событие старше 5 мин = протух
 SLOT_S = 0.4               # длительность слота Solana — переводит отставание слотов в секунды
 SWEEP_POLL_S = 600         # как часто проверять, не пора ли выводить прибыль
 PRIORITY = set(strategy.ENTRY["PRIORITY_ACTORS"])
+# Кошельки, чьи покупки ведём трекером ДАЖЕ БЕЗ конфлюенса — только наблюдение,
+# входа не происходит. Пустой список = выключено, поведение прежнее.
+СОЛО_АКТОРЫ = set(strategy.SIGNAL.get("TRACK_SOLO_ACTORS") or [])
+СОЛО_ОКНО_С = float(strategy.SIGNAL.get("TRACK_SOLO_S") or 900)
 
 
 def tradable(signal, независимых: int | None = None) -> tuple[bool, str]:
@@ -114,7 +118,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
     pos_intent: dict[str, str] = {}       # token -> id намерения в леджере
     stats = {"signals": 0, "strong": 0, "quiet": 0, "alerts": 0, "opens": 0, "exits": 0,
              "skipped_unsellable": 0, "skipped_rule": 0, "from_logs": 0, "from_rpc": 0,
-             "stale_slots": 0, "fake_confluence": 0, "skipped_paused": 0,
+             "stale_slots": 0, "fake_confluence": 0, "skipped_paused": 0, "solo_tracked": 0,
              "started": time.time(), "last_signal_ts": time.time()}
     loop = asyncio.get_event_loop()
     # Связки кошельков одного участника. Файл готовит отдельная задача по расписанию —
@@ -481,6 +485,19 @@ async def run(max_mc: float, seconds: int | None) -> None:
             except Exception:  # noqa: BLE001
                 pass          # журнал наблюдений не должен ронять торговлю
         if not signal:
+            # НАБЛЮДЕНИЕ ЗА НЕСОШЕДШИМИСЯ ПОКУПКАМИ (12.08). Замер: 76% токенов,
+            # купленных нашими акторами, никогда не складываются в конфлюенс —
+            # 2664 из 11092. Мы не видим три четверти того, что уже находим, и
+            # оценить пропущенное нечем: трекер регистрирует токен только после
+            # сигнала, поэтому у несошедшихся нет ни цены, ни траектории.
+            # Здесь ведём их КОРОТКО и БЕЗ ВХОДА — только чтобы через несколько
+            # суток можно было честно посчитать, чего стоил вход по одному актору.
+            if wallet in СОЛО_АКТОРЫ and price:
+                try:
+                    tracker.register(token, price, ev.ts, ttl=СОЛО_ОКНО_С)
+                    stats["solo_tracked"] += 1
+                except Exception as e:  # noqa: BLE001
+                    print(f"[solo] register fail {token[:8]}: {type(e).__name__}")
             return
         info = await loop.run_in_executor(None, market.token_info, token)
         if not info.get("price_usd") and price:                 # entry из он-чейн покупки
@@ -776,6 +793,7 @@ async def run(max_mc: float, seconds: int | None) -> None:
             msg = (f"жив {up_h:.0f}ч · v{strategy.VERSION} · сигналов={stats['signals']} "
                    f"(strong={stats['strong']} тихих={stats['quiet']} алертов={stats['alerts']} "
                    f"без незав.подтв.={stats['fake_confluence']}) · "
+                   f"соло-наблюдений={stats['solo_tracked']} · "
                    f"входов={stats['opens']} выходов={stats['exits']} · открытых={len(pm.open_tokens())} · "
                    f"трек={len(tracker.active)} · аном={tracker.anomalies} · "
                    f"замер цены: сбои {reachable.сбои_текстом()} · "

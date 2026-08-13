@@ -140,3 +140,17 @@ def test_watchlist_словарём_тоже_читается(tmp_path, monkeypa
 def test_нет_файла_watchlist_не_роняет_разбор(tmp_path, monkeypatch):
     monkeypatch.setattr(db.config, "OUTPUT_DIR", tmp_path)
     assert db._свои_кошельки() == set()
+
+
+def test_результат_сохраняется_с_полными_адресами(tmp_path, monkeypatch, сбор):
+    """Отчёт печатает адреса в сокращении, и первый прогон оставил только префиксы —
+    добавить кандидата в watchlist без повторного разбора было нельзя, а разбор
+    стоит десятки минут RPC."""
+    import json
+    monkeypatch.setattr(db.config, "OUTPUT_DIR", tmp_path)
+    сбор([(20.0, "A"), (15.0, "B")],
+         {"A": ["ПолныйАдресКошелькаОдин", "W2"], "B": ["ПолныйАдресКошелькаОдин", "W2"]})
+    db.собрать()
+    d = json.loads((tmp_path / "discover_candidates.json").read_text(encoding="utf-8"))
+    адреса = [k["кошелёк"] for k in d["кандидаты"]]
+    assert "ПолныйАдресКошелькаОдин" in адреса
