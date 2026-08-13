@@ -114,9 +114,24 @@ def reconcile(rows: list[dict] | None = None) -> dict:
             if ip and fp and ip > 0:
                 slippages.append(fp / ip - 1)
     import statistics
+    # ЖИВЫЕ ОТДЕЛЬНО (аудит 12.08). Общая доля исполнения смешивает бумагу, где она
+    # всегда 100%, с живым режимом, где она оказалась 63%. Смесь скрывала то, что
+    # треть боевых попыток не доходит до цепи.
+    жив_нам = [i for i in intents.values() if i.get("mode") == "live"]
+    жив_ид = {i["id"] for i in жив_нам}
+    жив_фил = sum(len(v) for k, v in fills.items() if k in жив_ид)
+    жив_отк = [r for r in rejects if r.get("intent_id") in жив_ид]
+    жив_без = [i for i in жив_нам if i["id"] not in fills]
+    # НЕОБЪЯСНЁННЫЕ: намерение не исполнилось и причина не записана. Аудит нашёл 180
+    # таких из 223 — 80% неудач были невидимы, пока отказ до отправки не логировался.
+    необъяснённых = max(len(жив_без) - len(жив_отк), 0)
     return {
         "intents": len(intents),
         "fills": sum(len(v) for v in fills.values()),
+        "live_intents": len(жив_нам),
+        "live_fills": жив_фил,
+        "live_fill_rate": (жив_фил / len(жив_нам)) if жив_нам else None,
+        "live_unexplained": необъяснённых,
         "unfilled": len(unfilled),            # намерения без исполнения (в live = провал tx!)
         "orphan_fills": len(orphan_fills),    # исполнение без намерения = ТРЕВОГА
         "rejects": len(rejects),              # попытки, не дошедшие до сделки
@@ -140,8 +155,14 @@ def summary() -> str:
     flag = "✅" if r["ok"] else "🛑 ЕСТЬ ИСПОЛНЕНИЯ БЕЗ НАМЕРЕНИЙ"
     extra = f", старых кросс-пар {r['crossed_legs']}" if r["crossed_legs"] else ""
     отк = f" · отказов {r['rejects']} ({r['reject_rate']:.0%})" if r["rejects"] else ""
+    жив = ""
+    if r.get("live_fill_rate") is not None:
+        жив = (f" · ЖИВЫХ: исполнено {r['live_fills']}/{r['live_intents']} "
+               f"({r['live_fill_rate']:.0%})")
+        if r["live_unexplained"]:
+            жив += f", БЕЗ ОБЪЯСНЕНИЯ {r['live_unexplained']}"
     return (f"{flag} леджер: намерений {r['intents']}, исполнений {r['fills']}, "
-            f"без исполнения {r['unfilled']}{extra}{отк}, {sl_txt}")
+            f"без исполнения {r['unfilled']}{extra}{отк}{жив}, {sl_txt}")
 
 
 if __name__ == "__main__":

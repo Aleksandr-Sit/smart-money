@@ -61,6 +61,26 @@ def _settled_token_balance_raw(mint: str, before_raw: int, tries: int = 12,
     return last, dec
 
 
+_КРИВАЯ_ПОСЛЕДНЯЯ: dict[str, float | None] = {}
+
+
+def _цена_кривой_из_логов(logs: list, mint: str) -> float | None:
+    """Цена кривой в SOL за токен из события pump.fun нашей же транзакции."""
+    try:
+        from . import log_parse
+        for e in log_parse._events(logs):
+            if e.get("mint") == mint and e.get("curve_price_sol"):
+                return e["curve_price_sol"]
+    except Exception:  # noqa: BLE001 — наблюдение не имеет права ломать сделку
+        pass
+    return None
+
+
+def цена_кривой_сделки(sig: str) -> float | None:
+    """Цена кривой, снятая при последнем разборе транзакции `sig`. None — не нашлась."""
+    return _КРИВАЯ_ПОСЛЕДНЯЯ.get(sig)
+
+
 def tx_deltas(sig: str, mint: str, tries: int = 10,
               pause: float = 2.0) -> tuple[float | None, int | None, int]:
     """Движение денег ИЗ САМОЙ ТРАНЗАКЦИИ. → (дельта SOL, дельта токена в ед., decimals).
@@ -106,6 +126,12 @@ def tx_deltas(sig: str, mint: str, tries: int = 10,
                 return 0, 0
             pre, d1 = _amt("preTokenBalances")
             post, d2 = _amt("postTokenBalances")
+            # ЦЕНА КРИВОЙ ИЗ НАШЕЙ ЖЕ ТРАНЗАКЦИИ — даром (12.08). Событие pump.fun
+            # несёт виртуальные резервы ПОСЛЕ сделки, а транзакция у нас уже в руках.
+            # Это даёт фрикцию на КАЖДОЙ сделке: фактическая цена из дельт против
+            # справедливой цены кривой в тот же миг. Прежде фрикция восстанавливалась
+            # раз в неделю разбором и стоила часов.
+            _КРИВАЯ_ПОСЛЕДНЯЯ[sig] = _цена_кривой_из_логов(m.get("logMessages") or [], mint)
             return sol_d, post - pre, (d2 or d1)
         time.sleep(pause)
     return None, None, 0
@@ -326,8 +352,18 @@ def buy(mint: str, usd: float | None = None) -> dict:
         return {"action": "dry_run", "intent": iid, "tokens_expected": tokens_expected,
                 "quoted_price": None, "usd": usd}
 
-    swap = _build_swap_tx(q)               # содержит симуляцию: провал → исключение
-    sig = _sign_and_send(swap)
+    # ОТКАЗ ДО ОТПРАВКИ ТОЖЕ ОТКАЗ (найдено аудитом 12.08). Между записью намерения и
+    # подтверждением лежат два пути — сборка с симуляцией и отправка, — и их исключения
+    # уходили наверх, не оставляя следа. Замер: 223 живых намерения без исполнения при
+    # ВСЕГО 43 записях reject, то есть 80% неудач были невидимы. Нельзя чинить долю
+    # отказов, не зная, из чего она состоит.
+    try:
+        swap = _build_swap_tx(q)           # содержит симуляцию: провал → исключение
+        sig = _sign_and_send(swap)
+    except Exception as e:
+        ledger.record_reject(iid, mint, f"{type(e).__name__}: {str(e)[:160]}",
+                             extra={"side": "buy", "стадия": "до отправки"})
+        raise
     ok, причина = confirm_detail(sig)
     raw_after, dec = _settled_token_balance_raw(mint, raw_before if raw_before is not None else -1)
     dec = dec or dec_before
@@ -342,6 +378,25 @@ def buy(mint: str, usd: float | None = None) -> dict:
     # ЗНАК КАК У ПРОДАЖИ: меньше получили — отрицательное. Считаем по КОЛИЧЕСТВУ,
     # чтобы не зависеть от decimals и не смешивать единицы (урок 10.08).
     slip = (got_raw / tokens_expected - 1) if (got_raw and tokens_expected) else None
+    # ЗАМЕР ФРИКЦИИ НА КАЖДОЙ ПОКУПКЕ (12.08). Только наблюдение: решение «состоялась
+    # ли сделка» по-прежнему принимается по балансу, ничего не меняется. Дельты дают
+    # фактически потраченный SOL, событие в той же транзакции — справедливую цену
+    # кривой. Их отношение и есть фрикция, и теперь она известна сразу, а не после
+    # недельного разбора.
+    факт_sol = кривая_sol = фрикция = None
+    if ok:
+        try:
+            # ОДНА ПОПЫТКА, БЕЗ ОЖИДАНИЯ. Транзакция подтверждена, значит доступна
+            # сразу; если узел молчит — теряем замер, а не время. Повторы здесь
+            # задержали бы ОТКРЫТИЕ ПОЗИЦИИ на секунды, и выход начал бы работать
+            # позже — цена наблюдения не может быть выше цены сделки.
+            факт_sol, факт_ток, факт_dec = tx_deltas(sig, mint, tries=1, pause=0)
+            кривая_sol = цена_кривой_сделки(sig)
+            if факт_sol and факт_ток and факт_ток > 0 and кривая_sol:
+                цена_факт = (-факт_sol) / (факт_ток / 10 ** (факт_dec or dec or 6))
+                фрикция = цена_факт / кривая_sol - 1
+        except Exception as e:  # noqa: BLE001
+            print(f"[swap] замер фрикции не вышел ({type(e).__name__}) — сделка не затронута")
     состоялась = bool(got_raw and got_raw > 0) or (ok and got is None)
     if not состоялась:
         # ИСПОЛНЕНИЯ НЕ БЫЛО — и записывать его нельзя. Прежде сюда писался fill с
@@ -356,7 +411,10 @@ def buy(mint: str, usd: float | None = None) -> dict:
                                                "tokens_expected_raw": tokens_expected,
                                                "tokens_got_raw": got_raw,
                                                "balance_before_raw": raw_before,
-                                               "balance_after_raw": raw_after})
+                                               "balance_after_raw": raw_after,
+                                               "sol_actual": факт_sol,
+                                               "curve_price_sol": кривая_sol,
+                                               "фрикция": фрикция})
     if ok and got is None:
         # подтверждено, но количество неизвестно: позицию открываем (выход продаёт
         # ВЕСЬ остаток, точное число для управления сделкой не нужно), замер теряем
@@ -425,8 +483,14 @@ def sell(mint: str, fraction: float = 1.0, reason: str = "exit") -> dict:
         return {"action": "dry_run", "intent": iid, "quoted_price": quoted_price,
                 "sol_out": sol_out, "fraction": fraction}
 
-    swap = _build_swap_tx(q)
-    sig = _sign_and_send(swap)
+    try:
+        swap = _build_swap_tx(q)
+        sig = _sign_and_send(swap)
+    except Exception as e:                 # см. пояснение в buy(): отказ до отправки
+        ledger.record_reject(iid, mint, f"{type(e).__name__}: {str(e)[:160]}",
+                             extra={"side": "sell", "стадия": "до отправки",
+                                    "reason_exit": reason})
+        raise
     ok, причина = confirm_detail(sig)
     # ФАКТ ИЗ САМОЙ ТРАНЗАКЦИИ, а не из баланса кошелька: параллельная покупка другой
     # позиции тратит SOL в то же окно, и разница балансов приписывала её нашей продаже
@@ -454,7 +518,13 @@ def sell(mint: str, fraction: float = 1.0, reason: str = "exit") -> dict:
                            extra={"confirmed": ok, "reason": reason,
                                   "quoted_price": quoted_price,
                                   "sol_quoted": sol_out, "sol_actual": sol_got,
-                                  "slippage_vs_quote": slip})
+                                  "slippage_vs_quote": slip,
+                                  "curve_price_sol": цена_кривой_сделки(sig),
+                                  "фрикция": (
+                                      ((sol_got * sol_usd / tokens_sold)
+                                       / (цена_кривой_сделки(sig) * sol_usd) - 1)
+                                      if (sol_got and tokens_sold
+                                          and цена_кривой_сделки(sig)) else None)})
     closed = None
     if ok and fraction >= 1.0:
         # рента ~$0.15 приятна, но продажа уже состоялась — сбой на закрытии аккаунта
