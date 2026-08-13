@@ -33,6 +33,11 @@ class RiskState:
     halted: bool = False
     halt_reason: str = ""
     halted_at: str = ""
+    # НАКОПИТЕЛЬНЫЙ счёт сделок ступени — НЕ обнуляется сменой суток. Нужен для
+    # возврата к живым деньгам ступенями: ступень 1 это ЗАМЕР на заранее назначенном
+    # числе сделок, и она обязана остановиться сама. Без этого «замер на 100 сделках»
+    # превращается в бессрочную торговлю, потому что никто не считает.
+    сделок_ступени: int = 0
 
 
 class RiskManager:
@@ -45,6 +50,7 @@ class RiskManager:
         self.daily_stop = float(r["DAILY_STOP_FRAC"])
         self.max_positions = int(r["MAX_POSITIONS"])
         self.max_loss_streak = int(r["MAX_LOSS_STREAK"])
+        self.предел_ступени = int(r.get("STAGE_MAX_TRADES") or 0)   # 0 = без предела
         self.mode = str(r["RISK_MODE"])        # 'shadow' (сбор данных) | 'enforce' (деньги)
         self.would_block = 0                   # сколько раз денежный лимит сработал бы в live
         self.path = path or (config.OUTPUT_DIR / "risk_state.json")
@@ -73,9 +79,14 @@ class RiskManager:
         today = _today()
         if self.state.day != today:
             was_daily_halt = self.state.halted and self.state.halt_reason.startswith("дневной стоп")
-            self.state = RiskState(day=today) if was_daily_halt else RiskState(
-                day=today, halted=self.state.halted, halt_reason=self.state.halt_reason,
-                halted_at=self.state.halted_at)
+            накоплено = self.state.сделок_ступени      # переживает смену суток намеренно
+            if was_daily_halt:
+                self.state = RiskState(day=today, сделок_ступени=накоплено)
+            else:
+                self.state = RiskState(day=today, halted=self.state.halted,
+                                       halt_reason=self.state.halt_reason,
+                                       halted_at=self.state.halted_at,
+                                       сделок_ступени=накоплено)
             self._save()
 
     # ---------- решения ----------
@@ -127,7 +138,18 @@ class RiskManager:
         else:
             s.loss_streak += 1
 
+        s.сделок_ступени += 1
         tripped = None
+        # ПРЕДЕЛ СТУПЕНИ проверяется ПЕРВЫМ: замер закончен — торговать дальше нечего,
+        # какими бы ни были прочие условия. Останов не дневной, поэтому смена суток
+        # его не снимает; снять можно только вручную, разобрав результат.
+        if self.предел_ступени and s.сделок_ступени >= self.предел_ступени and not s.halted:
+            s.halted = True
+            s.halt_reason = (f"ступень завершена: {s.сделок_ступени} сделок из "
+                             f"{self.предел_ступени} — замер собран, нужен разбор")
+            s.halted_at = datetime.now(timezone.utc).isoformat()
+            self._save()
+            return {"reason": s.halt_reason, "сделок": s.сделок_ступени}
         limit = -self.daily_stop * self.bankroll
         if s.realized_usd <= limit and not s.halted:
             s.halted = True
