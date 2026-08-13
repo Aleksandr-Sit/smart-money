@@ -119,7 +119,8 @@ _REASON_TXT = {"actors_exit": "акторы вышли", "take_profit": "тей�
                "orphan": "подобран без позиции"}
 
 
-def format_exit(pos, exit_price: float, reason: str, realized_pnl: float) -> str:
+def format_exit(pos, exit_price: float, reason: str, realized_pnl: float,
+                модель: float | None = None, разрыв: float | None = None) -> str:
     """Сообщение о выходе. Включает параметры ВХОДА намеренно.
 
     С 07.08 правило входа "all" — торгуем каждый сигнал, но уведомления о входе
@@ -140,13 +141,27 @@ def format_exit(pos, exit_price: float, reason: str, realized_pnl: float) -> str
     def _x(p):
         return f"{p/pos.entry_price:.2f}x" if (p and pos.entry_price) else "?"
 
+    # ЧТО МОДЕЛЬ, А ЧТО ДЕНЬГИ — ЯВНО (правка 13.08 по вопросу владельца).
+    # Прежнее сообщение ставило рядом MC входа и выхода, посчитанные по ценам АКТОРА,
+    # и `realized`, посчитанный по нашим деньгам. Читалось как противоречие: MC вырос
+    # с $6,981 до $8,389, а итог −40%. Противоречия не было — это две разные величины
+    # без единой пометки. Цена выхода актора вдобавок НЕДОСТИЖИМА по построению:
+    # его продажа и обрушила рынок, а мы продавали следом в ту же книгу.
+    по_деньгам = разрыв is not None
     lines = [
-        f"🔻 EXIT [{_REASON_TXT.get(reason, reason)}] {emoji} realized {realized_pnl:+.0%}",
+        f"🔻 EXIT [{_REASON_TXT.get(reason, reason)}] {emoji} "
+        f"{'ПО ДЕНЬГАМ' if по_деньгам else 'по модели'} {realized_pnl:+.0%}",
         f"token: {pos.token_mint}",
-        f"ВХОД {entered} UTC · акторов {len(pos.entry_actors)} · MC {_fmt_usd(pos.entry_mc)}",
-        f"держали {held_txt} · пик {_x(pos.peak_price)} · выход {_x(exit_price)}",
+        f"ВХОД {entered} UTC · акторов {len(pos.entry_actors)} · держали {held_txt}",
         f"вышло акторов: {len(pos.exited_actors)}/{len(pos.entry_actors)}",
-        f"выход MC ~{_fmt_usd((exit_price or 0) * 1_000_000_000)}",
+    ]
+    if по_деньгам:
+        lines.append(f"модель дала бы {(модель if модель is not None else 0):+.0%} · "
+                     f"РАЗРЫВ ИСПОЛНЕНИЯ {разрыв:+.0%}")
+    lines += [
+        f"цены АКТОРА (нам недоступны): вход MC {_fmt_usd(pos.entry_mc)} → "
+        f"выход MC ~{_fmt_usd((exit_price or 0) * 1_000_000_000)}, {_x(exit_price)}",
+        f"пик по трекеру {_x(pos.peak_price)}",
         f"📈 {lk['dexscreener']}",
     ]
     return "\n".join(lines)
@@ -174,7 +189,13 @@ def deliver_exit(pos, exit_price: float, reason: str, telegram: bool = True,
     rec = {"ts": now, "type": "exit", "strategy_version": strategy.VERSION,
            "mode": "live" if strategy.EXECUTION["LIVE_ENABLED"] else "paper",
            "token_mint": pos.token_mint, "reason": reason,
-           "entry_price": pos.entry_price, "exit_price": exit_price, "realized_pnl": realized,
+           # ЦЕНЫ ЗДЕСЬ — АКТОРА, НЕ НАШИ. Для actor-exit `exit_price` это цена, по
+           # которой продал АКТОР; его продажа обрушила рынок, и нам она недоступна.
+           # Пометка нужна, чтобы будущий анализ не посчитал по ним нашу доходность —
+           # ровно на этом мы уже обжигались (разрыв входа 12.15% оказался смесью
+           # издержек и движения рынка).
+           "entry_price": pos.entry_price, "exit_price": exit_price,
+           "цены_источник": "актор", "realized_pnl": realized,
            "realized_model": model, "exec_gap": exec_gap,
            "pnl_source": "деньги" if realized_actual is not None else "модель",
            "realized_net": realized_net, "realized_partial": pos.realized, "remaining": pos.remaining,
@@ -183,7 +204,9 @@ def deliver_exit(pos, exit_price: float, reason: str, telegram: bool = True,
     _append(config.OUTPUT_DIR / "signals.log", rec)
     _append(config.OUTPUT_DIR / "paper_closed.jsonl", rec)
     if telegram:
-        send_telegram(format_exit(pos, exit_price, reason, realized if realized is not None else 0.0))
+        send_telegram(format_exit(pos, exit_price, reason,
+                                  realized if realized is not None else 0.0,
+                                  модель=model, разрыв=exec_gap))
 
 
 def log_partial(pos, price: float | None, frac: float) -> None:

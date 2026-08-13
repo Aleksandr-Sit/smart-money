@@ -1,53 +1,58 @@
-"""Сообщение о выходе обязано быть самодостаточным.
+"""Сообщение о выходе: модель и деньги не должны стоять рядом без пометки.
 
-С 07.08 правило входа "all": торгуем каждый сигнал, но уведомления о ВХОДЕ уходят
-только для отобранных классов. Выходы объявляются все. Владелец 08.08 не смог найти,
-когда и по чему бот вошёл в токен, о выходе из которого пришло сообщение. Слать вход
-по каждой сделке нельзя (~200 сообщений в сутки), поэтому пара восстанавливается
-из самого сообщения о выходе.
+Владелец 13.08 прислал алерт: MC вырос с $6,981 до $8,389, а realized −40%.
+Противоречия не было — MC считались по ценам АКТОРА, а realized по нашим деньгам.
+Цена выхода актора вдобавок недостижима: его продажа и обрушила рынок, а мы
+продавали следом в ту же книгу и получили на 44% меньше.
 """
-import time
+import pytest
 
-from src.delivery import format_exit
-from src.positions import Position
-
-
-def _pos(**kw):
-    d = dict(token_mint="ASirAQA5UvfeAyxKwKVU7tYfdU6x28t428EEKDKopump",
-             entry_ts=time.time() - 1800, entry_price=8.584e-06, entry_mc=8584.0,
-             entry_actors=["a1", "a2"], peak_price=1.219e-05)
-    d.update(kw)
-    return Position(**d)
+from src import delivery, positions
 
 
-def test_вход_виден_в_сообщении_о_выходе():
-    m = format_exit(_pos(), 2.108e-06, "timeout", -0.754)
-    assert "ВХОД" in m and "UTC" in m
-    assert "акторов 2" in m          # состав входа
-    assert "$8,584" in m             # MC входа
-    assert "держали 30 мин" in m     # время удержания
+def _поз():
+    return positions.Position(token_mint="TOK", entry_price=6.98e-06, entry_ts=1000.0,
+                              entry_actors=["A", "B"], entry_mc=6981.0, peak_price=6.98e-06)
 
 
-def test_пик_и_выход_в_кратности_входа():
-    """Без пика непонятно, была ли позиция в плюсе — а это главный вопрос
-    при разборе убыточного выхода."""
-    m = format_exit(_pos(), 2.108e-06, "timeout", -0.754)
-    assert "пик 1.42x" in m
-    assert "выход 0.25x" in m
+def test_итог_по_деньгам_помечен_явно():
+    т = delivery.format_exit(_поз(), 8.39e-06, "actors_exit", -0.3966,
+                             модель=0.2018, разрыв=-0.5983)
+    assert "ПО ДЕНЬГАМ -40%" in т
+    assert "модель дала бы +20%" in т
+    assert "РАЗРЫВ ИСПОЛНЕНИЯ -60%" in т
 
 
-def test_короткое_удержание_в_секундах():
-    """Медиана удержания 24с — показывать «0 мин» бессмысленно."""
-    m = format_exit(_pos(entry_ts=time.time() - 17), 1.0e-05, "actors_exit", 0.17)
-    assert "держали 17 с" in m
+def test_цены_актора_названы_недоступными():
+    """Главная причина путаницы: MC выхода это цена, которую получил АКТОР."""
+    т = delivery.format_exit(_поз(), 8.39e-06, "actors_exit", -0.3966,
+                             модель=0.2018, разрыв=-0.5983)
+    assert "цены АКТОРА (нам недоступны)" in т
+    assert "выход MC" in т and "8,39" in т   # округление до доллара не важно
 
 
-def test_без_цены_выхода_не_падает():
-    """Цены может не быть (токен ослеп) — сообщение всё равно должно уйти."""
-    m = format_exit(_pos(), 0.0, "dead", -1.0)
-    assert "выход ?" in m and "token:" in m
+def test_без_фактических_денег_сообщение_говорит_по_модели():
+    """В бумажном режиме разрыва нет — и обещать «по деньгам» нельзя."""
+    т = delivery.format_exit(_поз(), 8.39e-06, "actors_exit", 0.2018)
+    assert "по модели +20%" in т
+    assert "ПО ДЕНЬГАМ" not in т
+    assert "РАЗРЫВ" not in т
 
 
-def test_без_времени_входа_не_падает():
-    m = format_exit(_pos(entry_ts=0), 2.1e-06, "timeout", -0.75)
-    assert "ВХОД ?" in m
+def test_пик_и_выход_из_разных_источников_разведены():
+    """В прежнем сообщении «пик 1.00x» стояло рядом с «выход 1.20x» — пик физически
+    не может быть ниже выхода, если источник один. Источники разные, и это сказано."""
+    т = delivery.format_exit(_поз(), 8.39e-06, "actors_exit", -0.4, модель=0.2, разрыв=-0.6)
+    assert "пик по трекеру" in т
+
+
+def test_запись_помечает_чьи_цены(monkeypatch):
+    out = []
+    monkeypatch.setattr(delivery, "_append", lambda p, o: out.append(o))
+    monkeypatch.setattr(delivery, "send_telegram", lambda *a, **k: None)
+    delivery.deliver_exit(_поз(), 8.39e-06, "actors_exit", telegram=False,
+                          realized_actual=-0.3966, exec_gap=-0.5983)
+    rec = out[-1]
+    assert rec["цены_источник"] == "актор"
+    assert rec["realized_pnl"] == pytest.approx(-0.3966)
+    assert rec["pnl_source"] == "деньги"
