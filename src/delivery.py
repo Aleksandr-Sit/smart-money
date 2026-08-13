@@ -197,7 +197,8 @@ def log_partial(pos, price: float | None, frac: float) -> None:
 
 
 def log_actor_buy(actor: str, wallet: str, token: str, usd: float, ts: float,
-                  converged: bool, n_actors: int, price: float | None = None) -> None:
+                  converged: bool, n_actors: int, price: float | None = None,
+                  curve_price: float | None = None) -> None:
     """Лог КАЖДОЙ покупки watchlist-кошелька — сошлась она в сигнал или нет.
 
     ЦЕНА ДОБАВЛЕНА 11.08 и это ключевое поле. Аудит входа показал, что каждый лишний
@@ -223,6 +224,11 @@ def log_actor_buy(actor: str, wallet: str, token: str, usd: float, ts: float,
     _append(config.OUTPUT_DIR / "actor_buys.jsonl",
             {"ts": ts, "actor": actor, "wallet": wallet, "token_mint": token,
              "usd": round(usd, 2), "price": price,
+           # ЦЕНА КРИВОЙ В МОМЕНТ СДЕЛКИ — из того же события pump.fun, даром
+           # (12.08). Прежде за ней ходили отдельным getAccountInfo, и ответ приходил
+           # секундами позже: на свежем токене это уже другая цена. Теперь разрыв
+           # «цена актора против рынка» измерим точно и на каждой покупке.
+           "curve_price": curve_price,
              "converged": converged, "n_actors": n_actors})
 
 

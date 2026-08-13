@@ -123,17 +123,61 @@ def _свои_кошельки() -> set[str]:
     return свои
 
 
-def собрать(мин_рост: float = 10.0, токенов: int = 40, ранних: int = 25) -> dict:
+КЭШ_ФАЙЛ = "discover_cache.json"
+
+
+def _кэш() -> dict[str, list[str]]:
+    """Уже разобранные токены: mint → ранние покупатели.
+
+    Публичный узел режет запросы, и разбор одного победителя стоит ~25 вызовов.
+    Прогон по 84 токенам вставал на часы, а при обрыве терялось ВСЁ. Кэш делает
+    разбор возобновляемым: гоняем порциями, каждая продолжает предыдущую.
+    """
+    import json as _json
+    try:
+        with open(config.OUTPUT_DIR / КЭШ_ФАЙЛ, encoding="utf-8") as f:
+            d = _json.load(f)
+        return {k: v for k, v in d.items() if isinstance(v, list)}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _записать_кэш(кэш: dict) -> None:
+    import json as _json
+    try:
+        config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = config.OUTPUT_DIR / (КЭШ_ФАЙЛ + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json.dump(кэш, f, ensure_ascii=False)
+        tmp.replace(config.OUTPUT_DIR / КЭШ_ФАЙЛ)
+    except Exception as e:  # noqa: BLE001
+        print(f"[поиск] кэш не сохранён: {type(e).__name__}")
+
+
+def собрать(мин_рост: float = 10.0, токенов: int = 40, ранних: int = 25,
+            за_прогон: int | None = None) -> dict:
+    """`за_прогон` — сколько НОВЫХ токенов разбирать за один запуск (остальные из кэша)."""
     поб = победители(мин_рост)[:токенов]
     if not поб:
         return {"мало_данных": True, "победителей": 0}
     свои = _свои_кошельки()
 
+    кэш = _кэш()
+    новых = 0
+    for рост, m in поб:
+        if m in кэш:
+            continue
+        if за_прогон is not None and новых >= за_прогон:
+            break
+        кэш[m] = ранние_покупатели(m, ранних)
+        новых += 1
+        _записать_кэш(кэш)          # после КАЖДОГО токена: обрыв не теряет работу
+
     счёт: Counter = Counter()
     места: dict[str, list[int]] = defaultdict(list)
     разобрано = 0
     for рост, m in поб:
-        кош = ранние_покупатели(m, ранних)
+        кош = кэш.get(m)
         if not кош:
             continue
         разобрано += 1
@@ -148,7 +192,9 @@ def собрать(мин_рост: float = 10.0, токенов: int = 40, ра
                           "медиана_места": sorted(места[w])[len(места[w]) // 2],
                           "в_списке": w in свои})
     кандидаты.sort(key=lambda x: (-x["победителей"], x["медиана_места"]))
+    осталось = sum(1 for _, m in поб if m not in кэш)
     d = {"мало_данных": False, "победителей": len(поб), "разобрано": разобрано,
+         "осталось_разобрать": осталось,
          "мин_рост": мин_рост, "кандидаты": кандидаты,
          "новых": [k for k in кандидаты if not k["в_списке"]]}
     _сохранить(d)
@@ -181,7 +227,9 @@ def отчёт(d: dict, показать: int = 15) -> str:
         f"ОБРАТНЫЙ ПОИСК ПО ПОБЕДИТЕЛЯМ · рост >= {d['мин_рост']:.0f}x · "
         f"разобрано {d['разобрано']} из {d['победителей']} токенов",
         f"кошельков, встретившихся минимум в двух победителях: {len(d['кандидаты'])}, "
-        f"из них НЕ в watchlist: {len(d['новых'])}",
+        f"из них НЕ в watchlist: {len(d['новых'])}"
+        + (f" · осталось разобрать: {d['осталось_разобрать']}"
+           if d.get("осталось_разобрать") else " · выборка разобрана полностью"),
         "",
     ]
     if d["новых"]:
@@ -208,9 +256,12 @@ def main() -> None:
     ap.add_argument("--рост", type=float, default=10.0)
     ap.add_argument("--токенов", type=int, default=40)
     ap.add_argument("--ранних", type=int, default=25)
+    ap.add_argument("--за-прогон", type=int, default=None,
+                    help="сколько НОВЫХ токенов разобрать за запуск (кэш продолжается)")
     ap.add_argument("--telegram", action="store_true")
     a = ap.parse_args()
-    d = собрать(getattr(a, "рост"), getattr(a, "токенов"), getattr(a, "ранних"))
+    d = собрать(getattr(a, "рост"), getattr(a, "токенов"), getattr(a, "ранних"),
+                getattr(a, "за_прогон"))
     txt = отчёт(d)
     print(txt)
     if a.telegram:

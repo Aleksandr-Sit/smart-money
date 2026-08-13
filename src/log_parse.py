@@ -66,8 +66,23 @@ def _events(logs: list[str]) -> list[dict]:
             continue
         if not sol_lamports or not token_raw:
             continue
-        out.append({"mint": mint, "user": user, "lamports": sol_lamports,
-                    "tokens": token_raw, "is_buy": is_buy})
+        e = {"mint": mint, "user": user, "lamports": sol_lamports,
+             "tokens": token_raw, "is_buy": is_buy, "curve_price_sol": None}
+        # ВИРТУАЛЬНЫЕ РЕЗЕРВЫ ПОСЛЕ СДЕЛКИ (найдено 12.08). За полем user в TradeEvent
+        # идут timestamp(i64) и virtual_sol_reserves/virtual_token_reserves (u64).
+        # Это цена кривой в МОМЕНТ сделки, полученная даром: событие и так приходит
+        # к нам по WS. Раньше за той же ценой ходили отдельным getAccountInfo, и
+        # ответ приходил секундами позже — а на свежем токене это уже другая цена.
+        # Проверка на живой транзакции: цена кривой после покупки = 1.0019 от цены
+        # исполнения, ровно как предписывает математика бондинг-кривой.
+        if len(raw) >= 113:
+            try:
+                _ts, vsol, vtok = struct.unpack_from("<qQQ", raw, 89)
+                if vsol > 0 and vtok > 0:
+                    e["curve_price_sol"] = (vsol / 1e9) / (vtok / 1e6)
+            except Exception:  # noqa: BLE001
+                pass
+        out.append(e)
     return out
 
 
@@ -105,6 +120,8 @@ def parse_logs(logs: list[str], signature: str = "", wallet: str = "") -> dict |
         "sol": e["lamports"] / 1e9,
         "usd_proceeds": 0.0,
         "fee": 0.0,                              # комиссия в логах не выделена; учтена в EXIT_FEE
+        # цена кривой в момент сделки — из того же события, без единого запроса
+        "curve_price_sol": e.get("curve_price_sol"),
         "ts": None,                              # проставит вызывающий (время получения)
         "source": "logs",
         "signature": signature,

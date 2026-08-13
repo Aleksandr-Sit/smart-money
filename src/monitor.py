@@ -481,7 +481,8 @@ async def run(max_mc: float, seconds: int | None) -> None:
             try:
                 delivery.log_actor_buy(_actor[0], wallet, token, ev.usd, ev.ts,
                                        bool(signal), signal.n_actors if signal else 0,
-                                       price)
+                                       price, (trade.get("curve_price_sol") or 0) * sol
+                                       or None)
             except Exception:  # noqa: BLE001
                 pass          # журнал наблюдений не должен ронять торговлю
         if not signal:
