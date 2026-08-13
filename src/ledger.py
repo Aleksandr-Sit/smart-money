@@ -53,6 +53,17 @@ def record_fill(intent_id: str, token: str, price: float | None, usd: float,
              "signature": signature, **(extra or {})})
 
 
+def record_measure(intent_id: str, token: str, **поля) -> None:
+    """Записать ЗАМЕР, доехавший позже сделки. Денег не двигает, решений не принимает.
+
+    Отдельный тип записи, а не дописывание в `fill`: журнал append-only, а замер
+    фрикции приходит из фонового потока через несколько секунд после исполнения.
+    Сшивается с исполнением по `intent_id`.
+    """
+    _append({"ts": _now(), "type": "measure", "intent_id": intent_id,
+             "token_mint": token, **поля})
+
+
 def record_reject(intent_id: str, token: str, reason: str, signature: str | None = None,
                   mode: str = "live", extra: dict | None = None) -> None:
     """Записать НЕСОСТОЯВШУЮСЯ сделку. Это НЕ исполнение — денег не двигалось.

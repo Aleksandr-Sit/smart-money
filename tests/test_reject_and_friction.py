@@ -21,7 +21,9 @@ def живой(monkeypatch):
         available = True
         address = "КОШЕЛЁК"
     monkeypatch.setattr(swap.wallet, "Wallet", lambda: _W())
-    записи = {"intent": [], "reject": [], "fill": []}
+    записи = {"intent": [], "reject": [], "fill": [], "measure": []}
+    monkeypatch.setattr(swap.ledger, "record_measure",
+                        lambda *a, **k: записи["measure"].append((a, k)))
     monkeypatch.setattr(swap.ledger, "record_intent",
                         lambda *a, **k: (записи["intent"].append(k), "ID")[1])
     monkeypatch.setattr(swap.ledger, "record_reject",
@@ -99,18 +101,35 @@ def test_замер_фрикции_не_роняет_покупку(живой, 
     assert живой["fill"], "сделка обязана записаться несмотря на сбой замера"
 
 
-def test_фрикция_считается_и_попадает_в_запись(живой, monkeypatch):
+def test_фрикция_считается_и_попадает_в_свою_запись(живой, monkeypatch):
+    """Замер приходит ПОЗЖЕ сделки и своей записью: журнал append-only.
+
+    До 13.08 фрикция считалась прямо в покупке одной попыткой, чтобы не задерживать
+    позицию, и заполнялась лишь у 21% сделок — в группе крупных выигрышей осталось
+    девять замеров, то есть показатель был непригоден там, где нужен.
+    """
+    # потратили 0.11 SOL, получили 1.0 токен → цена 0.11; кривая 0.10 → фрикция +10%
+    monkeypatch.setattr(swap, "tx_deltas", lambda *a, **k: (-0.11, 10 ** 6, 6))
+    monkeypatch.setattr(swap, "цена_кривой_сделки", lambda sig: 0.10)
+    swap._замер_фрикции("ID", "SIG", "TOK", 6)
+    (_, kw) = живой["measure"][0]
+    assert kw["фрикция"] == pytest.approx(0.10, abs=1e-6)
+    assert kw["curve_price_sol"] == pytest.approx(0.10)
+
+
+def test_покупка_не_ждёт_замера(живой, monkeypatch):
+    """Замер ушёл в фон — покупка обязана вернуться, не дожидаясь узла."""
     monkeypatch.setattr(swap, "_build_swap_tx", lambda q: {"tx": 1})
     monkeypatch.setattr(swap, "_sign_and_send", lambda s: "SIG")
     monkeypatch.setattr(swap, "confirm_detail", lambda sig, timeout_s=None: (True, None))
     monkeypatch.setattr(swap, "_settled_token_balance_raw", lambda m, b, **k: (10 ** 6, 6))
-    # потратили 0.11 SOL, получили 1.0 токен → цена 0.11; кривая 0.10 → фрикция +10%
-    monkeypatch.setattr(swap, "tx_deltas", lambda *a, **k: (-0.11, 10 ** 6, 6))
-    monkeypatch.setattr(swap, "цена_кривой_сделки", lambda sig: 0.10)
-    swap.buy("TOK", 10.0)
-    extra = живой["fill"][0][1]["extra"]
-    assert extra["фрикция"] == pytest.approx(0.10, abs=1e-6)
-    assert extra["curve_price_sol"] == pytest.approx(0.10)
+    запущено = []
+    monkeypatch.setattr(swap.threading, "Thread",
+                        lambda **k: type("_T", (), {"start": lambda s: запущено.append(k)})())
+    r = swap.buy("TOK", 10.0)
+    assert r["action"] == "bought"
+    assert запущено and запущено[0]["target"] is swap._замер_фрикции
+    assert запущено[0]["daemon"] is True, "поток не должен держать процесс при остановке"
 
 
 # ---------- видимость доли исполнения ----------
